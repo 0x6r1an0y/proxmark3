@@ -9628,7 +9628,7 @@ static int gdm_write_config(uint8_t wakeup, uint8_t auth_cmd, const uint8_t *key
     }
     if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "Failed to write config. Status: %d", resp.status);
-        return PM3_EFAILED;
+        return resp.status;
     }
     return PM3_SUCCESS;
 }
@@ -10105,8 +10105,9 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
         return vres;
     }
 
-    if (gdm_write_config(wakeup_type, auth_cmd, key, config) != PM3_SUCCESS) {
-        return PM3_EFAILED;
+    int res = gdm_write_config(wakeup_type, auth_cmd, key, config);
+    if (res != PM3_SUCCESS) {
+        return res;
     }
 
     PrintAndLogEx(SUCCESS, "Config updated successfully");
@@ -10211,7 +10212,7 @@ static int CmdHF14AGen4_GDM_SetBlk(const char *Cmd) {
     } else {
         PrintAndLogEx(FAILED, "Write ( " _RED_("fail") " )");
     }
-    return PM3_SUCCESS;
+    return resp.status;
 }
 
 static int CmdHF14AGen4_GDM_SetHidBlk(const char *Cmd) {
@@ -10356,7 +10357,7 @@ static int CmdHF14AGen4_GDM_SetHidBlk(const char *Cmd) {
     } else {
         PrintAndLogEx(FAILED, "Write ( " _RED_("fail") " )");
     }
-    return PM3_SUCCESS;
+    return resp.status;
 }
 
 // Shared worker for gdmgetblk / gdmgethidblk: reads a single block (--blk) or a
@@ -10608,8 +10609,9 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
 
     // Step 3: Write config if needed
     if (update_config) {
-        if (gdm_write_config(wakeup_type, auth_cmd, key, config) != PM3_SUCCESS) {
-            return PM3_EFAILED;
+        int res = gdm_write_config(wakeup_type, auth_cmd, key, config);
+        if (res != PM3_SUCCESS) {
+            return res;
         }
         PrintAndLogEx(SUCCESS, "Config updated successfully");
     }
@@ -10624,7 +10626,7 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
         }
         if (resp.status != PM3_SUCCESS) {
             PrintAndLogEx(FAILED, "Failed to write hidden block 0. Status: %d", resp.status);
-            return PM3_EFAILED;
+            return resp.status;
         }
         PrintAndLogEx(SUCCESS, "Hidden block 0 updated successfully");
     }
@@ -10638,7 +10640,7 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
     }
     if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "Failed to write real block %d. Status: %d", write_payload.block_no, resp.status);
-        return PM3_EFAILED;
+        return resp.status;
     }
     PrintAndLogEx(SUCCESS, "Real block %d updated successfully", write_payload.block_no);
 
@@ -10708,7 +10710,9 @@ static int CmdHF14AGen4_GDM_Wipe(const char *Cmd) {
     clearCommandBuffer();
     SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&config_payload, sizeof(config_payload));
     PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false || resp.status != PM3_SUCCESS) {
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false) {
+        PrintAndLogEx(FAILED, "Failed to write standard config: timeout");
+    } else if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "Failed to write standard config. Status: %d", resp.status);
     } else {
         PrintAndLogEx(SUCCESS, "Standard config written");
@@ -10844,9 +10848,13 @@ static int CmdHF14AGen4_GDM_SetSig(const char *Cmd) {
     clearCommandBuffer();
     SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&write_payload, sizeof(write_payload));
     PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false || resp.status != PM3_SUCCESS) {
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false) {
+        PrintAndLogEx(FAILED, "Failed to write signature part 1 (block 5): timeout");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "Failed to write signature part 1 (block 5). Status: %d", resp.status);
-        return PM3_EFAILED;
+        return resp.status;
     }
     PrintAndLogEx(SUCCESS, "Signature part 1 written to block 5");
 
@@ -10856,9 +10864,13 @@ static int CmdHF14AGen4_GDM_SetSig(const char *Cmd) {
 
     clearCommandBuffer();
     SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&write_payload, sizeof(write_payload));
-    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false || resp.status != PM3_SUCCESS) {
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false) {
+        PrintAndLogEx(FAILED, "Failed to write signature part 2 (block 6): timeout");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "Failed to write signature part 2 (block 6). Status: %d", resp.status);
-        return PM3_EFAILED;
+        return resp.status;
     }
     PrintAndLogEx(SUCCESS, "Signature part 2 written to block 6");
 
@@ -10870,8 +10882,9 @@ static int CmdHF14AGen4_GDM_SetSig(const char *Cmd) {
 
     if (config[13] != 0x5A) {
         config[13] = 0x5A;
-        if (gdm_write_config(wakeup_type, auth_cmd, key, config) != PM3_SUCCESS) {
-            return PM3_EFAILED;
+        int res = gdm_write_config(wakeup_type, auth_cmd, key, config);
+        if (res != PM3_SUCCESS) {
+            return res;
         }
         PrintAndLogEx(SUCCESS, "Enabled signature sector in config (config[13] = 0x5A)");
     } else {
@@ -10890,9 +10903,13 @@ static int CmdHF14AGen4_GDM_SetSig(const char *Cmd) {
 
     clearCommandBuffer();
     SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&trailer_payload, sizeof(trailer_payload));
-    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false || resp.status != PM3_SUCCESS) {
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false) {
+        PrintAndLogEx(FAILED, "Failed to write signature sector trailer (hidden block 7): timeout");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "Failed to write signature sector trailer (hidden block 7). Status: %d", resp.status);
-        return PM3_EFAILED;
+        return resp.status;
     }
     PrintAndLogEx(SUCCESS, "Signature sector trailer written to hidden block 7");
 
