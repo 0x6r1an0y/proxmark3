@@ -9828,6 +9828,57 @@ static int gdm_arg_onoff(CLIParserContext *ctx, int idx) {
     return 0;
 }
 
+static bool gdm_cfg_has_magic_wakeup(const uint8_t *config) {
+    return config[0] == 0x7A && config[1] == 0xFF && (config[2] == 0x00 || config[2] == 0x85);
+}
+
+static bool gdm_cfg_has_magic_auth(const uint8_t *config) {
+    return config[11] == 0x5A;
+}
+
+static bool gdm_cfg_is_cl2(const uint8_t *config) {
+    return config[9] == 0x5A || config[9] == 0xC3 || config[9] == 0xA5;
+}
+
+static int gdm_validate_config_change(const uint8_t *current, const uint8_t *candidate, bool force) {
+    bool unsafe_access = !gdm_cfg_has_magic_wakeup(candidate) && !gdm_cfg_has_magic_auth(candidate);
+    bool unsafe_uid = current[9] != candidate[9];
+
+    if (unsafe_access) {
+        PrintAndLogEx(WARNING, "This configuration disables all known magic access methods");
+        PrintAndLogEx(WARNING, "Magic configuration may become permanently inaccessible");
+    }
+
+    if (unsafe_uid) {
+        PrintAndLogEx(WARNING, "Changing UID personality byte 9 (%02X -> %02X) without preparing UID storage may make the card unselectable",
+                      current[9], candidate[9]);
+        if (!gdm_cfg_is_cl2(current) && gdm_cfg_is_cl2(candidate)) {
+            PrintAndLogEx(WARNING, "4-byte to 7-byte mode requires a valid hidden block 0");
+        } else if (gdm_cfg_is_cl2(current) && !gdm_cfg_is_cl2(candidate)) {
+            PrintAndLogEx(WARNING, "7-byte to 4-byte mode requires a valid real block 0");
+        }
+    }
+
+    if (!unsafe_access && !unsafe_uid) {
+        return PM3_SUCCESS;
+    }
+
+    if (force) {
+        PrintAndLogEx(WARNING, "Proceeding with unsafe configuration because " _YELLOW_("--force") " was specified");
+        return PM3_SUCCESS;
+    }
+
+    if (unsafe_access) {
+        PrintAndLogEx(HINT, "Hint: keep a gen1a/gdm wakeup or Magic Auth enabled");
+    }
+    if (unsafe_uid) {
+        PrintAndLogEx(HINT, "Hint: use " _YELLOW_("hf mf gdmsetuid -u <UID>") " to change UID mode safely");
+        PrintAndLogEx(HINT, "      only override if the target UID storage is already valid");
+    }
+    PrintAndLogEx(HINT, "      use " _YELLOW_("--force") " to override these safety checks");
+    return PM3_EINVARG;
+}
+
 static int CmdHF14AGen4_GDM_Cfg(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mf gdmgetcfg",
@@ -9887,7 +9938,8 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
                   "Can either write raw 16 bytes (-d) or configure specific flags.\n"
                   "If flags are provided, it will read the config, update flags, and write it back.\n"
                   "With no wakeup flag it auto-detects the card's access mode (WUPA magic auth, gen1a, or gdm alt).\n"
-                  "`access:` flags select how this command talks to the card; `config:` flags change what is stored.",
+                  "`access:` flags select how this command talks to the card; `config:` flags change what is stored.\n"
+                  "Potentially unsafe access or UID-personality changes require `--force`.",
                   "hf mf gdmsetcfg -d 850000000000000000005A5A00000008\n"
                   "hf mf gdmsetcfg --cuid on --wakestyle gen1a\n"
                   "hf mf gdmsetcfg --wakestyle off\n"
@@ -9907,6 +9959,7 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
         arg_str0(NULL, "statenc", "<on|off>", "config: Static encrypted nonce"),
         arg_str0(NULL, "sigsec", "<on|off>", "config: Signature sector"),
         arg_str0(NULL, "wakestyle", "<gdm|gen1a|off>", "config: backdoor - gdm (7AFF85), gen1a (7AFF00), or off (8500, seal)"),
+        arg_lit0(NULL, "force", "allow a config that may disable magic access or use unprepared UID storage"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -9947,6 +10000,7 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
             return PM3_EINVARG;
         }
     }
+    bool force = arg_get_lit(ctx, 13);
 
     CLIParserFree(ctx);
 
@@ -9973,53 +10027,30 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
                      magicauth_flag != -1 || statenc_flag != -1 || sigsec_flag != -1 ||
                      wakestyle != WS_NONE);
 
-    // Logic: if -d is specified, write raw block.
-    // Else, read config, update flags, write block.
-    if (blen == MFBLOCK_SIZE) {
-        if (any_flag) {
-            PrintAndLogEx(WARNING, "Ignoring config flags since -d raw data is provided.");
-        }
-
-        mf_writeblock_ex_t payload = {
-            .wakeup = wakeup_type,
-            .auth_cmd = auth_cmd,
-            .write_cmd = MIFARE_MAGIC_GDM_WRITE_CFG,
-            .block_no = 0,
-        };
-        memcpy(payload.block_data, block, sizeof(payload.block_data));
-        memcpy(payload.key, key, sizeof(payload.key));
-
-        clearCommandBuffer();
-        SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&payload, sizeof(payload));
-        PacketResponseNG resp;
-        if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false) {
-            PrintAndLogEx(WARNING, "command execution time out");
-            return PM3_ETIMEOUT;
-        }
-
-        if (resp.status == PM3_SUCCESS) {
-            PrintAndLogEx(SUCCESS, "Write ( " _GREEN_("ok") " )");
-            PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mf gdmgetcfg") "` to verify");
-        } else {
-            PrintAndLogEx(FAILED, "Write ( " _RED_("fail") " )");
-        }
-        return PM3_SUCCESS;
-    }
-
-    // Config flag mode
-    if (any_flag == false) {
+    if (blen == 0 && any_flag == false) {
         PrintAndLogEx(FAILED, "Must specify at least one configuration flag, or provide raw data using -d");
         return PM3_EINVARG;
     }
 
-    // Step 1: Read config - reuse the block already read while auto-probing the wakeup.
-    uint8_t config[MFBLOCK_SIZE];
+    // Read config - reuse the block already read while auto-probing the wakeup.
+    uint8_t current_config[MFBLOCK_SIZE];
     if (have_probe) {
-        memcpy(config, probe_cfg, MFBLOCK_SIZE);
-    } else if (gdm_read_config(wakeup_type, auth_cmd, key, config) != PM3_SUCCESS) {
+        memcpy(current_config, probe_cfg, MFBLOCK_SIZE);
+    } else if (gdm_read_config(wakeup_type, auth_cmd, key, current_config) != PM3_SUCCESS) {
         return PM3_EFAILED;
     }
+
+    uint8_t config[MFBLOCK_SIZE];
+    memcpy(config, current_config, MFBLOCK_SIZE);
     bool changed = false;
+
+    if (blen == MFBLOCK_SIZE) {
+        if (any_flag) {
+            PrintAndLogEx(WARNING, "Ignoring config flags since -d raw data is provided.");
+        }
+        memcpy(config, block, MFBLOCK_SIZE);
+        changed = memcmp(current_config, config, MFBLOCK_SIZE) != 0;
+    } else {
 
 #define APPLY_CONFIG_FLAG(flag, idx, on_val, off_val, name) \
         if (flag != -1) { \
@@ -10031,43 +10062,37 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
             } \
         }
 
-    if (wakestyle == WS_OFF) {
-        if (config[0] != 0x85 || config[1] != 0x00) {
-            config[0] = 0x85;
-            config[1] = 0x00;
-            changed = true;
-            PrintAndLogEx(INFO, "Set magic wakeup to off (backdoor sealed)");
-            PrintAndLogEx(WARNING, "Both gdm and gen1a wakeups are now disabled; only WUPA magic auth remains");
+        if (wakestyle == WS_OFF) {
+            if (config[0] != 0x85 || config[1] != 0x00) {
+                config[0] = 0x85;
+                config[1] = 0x00;
+                changed = true;
+                PrintAndLogEx(INFO, "Set magic wakeup to off (backdoor sealed)");
+            }
+        } else if (wakestyle == WS_GDM || wakestyle == WS_GEN1A) {
+            if (config[0] != 0x7A || config[1] != 0xFF) {
+                config[0] = 0x7A;
+                config[1] = 0xFF;
+                changed = true;
+                PrintAndLogEx(INFO, "Set magic wakeup to on");
+            }
+            uint8_t style_byte = (wakestyle == WS_GDM) ? 0x85 : 0x00;
+            if (config[2] != style_byte) {
+                config[2] = style_byte;
+                changed = true;
+                PrintAndLogEx(INFO, "Set wakeup style to %s", (wakestyle == WS_GDM) ? "gdm alt (20/23)" : "gen1a (40/43)");
+                PrintAndLogEx(WARNING, "After this write the card answers " _YELLOW_("--%s") " only, not the other one",
+                              (wakestyle == WS_GDM) ? "gdm" : "gen1a");
+            }
         }
-    } else if (wakestyle == WS_GDM || wakestyle == WS_GEN1A) {
-        if (config[0] != 0x7A || config[1] != 0xFF) {
-            config[0] = 0x7A;
-            config[1] = 0xFF;
-            changed = true;
-            PrintAndLogEx(INFO, "Set magic wakeup to on");
-        }
-        uint8_t style_byte = (wakestyle == WS_GDM) ? 0x85 : 0x00;
-        if (config[2] != style_byte) {
-            config[2] = style_byte;
-            changed = true;
-            PrintAndLogEx(INFO, "Set wakeup style to %s", (wakestyle == WS_GDM) ? "gdm alt (20/23)" : "gen1a (40/43)");
-            PrintAndLogEx(WARNING, "After this write the card answers " _YELLOW_("--%s") " only, not the other one",
-                          (wakestyle == WS_GDM) ? "gdm" : "gen1a");
-        }
-    }
 
-    APPLY_CONFIG_FLAG(cuid_flag, 7, 0x5A, 0x00, "CUID mode");
-    APPLY_CONFIG_FLAG(cl2_flag, 9, 0x5A, 0x00, "CL2 mode");
-    APPLY_CONFIG_FLAG(shadow_flag, 10, 0x5A, 0x00, "Shadow mode");
-    APPLY_CONFIG_FLAG(magicauth_flag, 11, 0x5A, 0x00, "Magic auth");
-    APPLY_CONFIG_FLAG(statenc_flag, 12, 0x5A, 0x00, "Static encrypted nonce");
-    APPLY_CONFIG_FLAG(sigsec_flag, 13, 0x5A, 0x00, "Signature sector");
+        APPLY_CONFIG_FLAG(cuid_flag, 7, 0x5A, 0x00, "CUID mode");
+        APPLY_CONFIG_FLAG(cl2_flag, 9, 0x5A, 0x00, "CL2 mode");
+        APPLY_CONFIG_FLAG(shadow_flag, 10, 0x5A, 0x00, "Shadow mode");
+        APPLY_CONFIG_FLAG(magicauth_flag, 11, 0x5A, 0x00, "Magic auth");
+        APPLY_CONFIG_FLAG(statenc_flag, 12, 0x5A, 0x00, "Static encrypted nonce");
+        APPLY_CONFIG_FLAG(sigsec_flag, 13, 0x5A, 0x00, "Signature sector");
 #undef APPLY_CONFIG_FLAG
-
-    if (cl2_flag == 1) {
-        PrintAndLogEx(WARNING, "CL2 (7-byte UID) perso enabled via config flag only - this does NOT set a valid 7-byte UID");
-        PrintAndLogEx(HINT, "Hint: run `hf mf gdmsetuid -u <7-byte hex>` to write valid perso data,");
-        PrintAndLogEx(HINT, "      otherwise the card presents ATQA 0000 and becomes unselectable (including --wupa)");
     }
 
     if (!changed) {
@@ -10075,7 +10100,11 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
         return PM3_SUCCESS;
     }
 
-    // Step 2: Write config
+    int vres = gdm_validate_config_change(current_config, config, force);
+    if (vres != PM3_SUCCESS) {
+        return vres;
+    }
+
     if (gdm_write_config(wakeup_type, auth_cmd, key, config) != PM3_SUCCESS) {
         return PM3_EFAILED;
     }

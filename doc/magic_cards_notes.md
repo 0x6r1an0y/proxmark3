@@ -1069,6 +1069,7 @@ Possible tag wakeup mechanisms are:
   * Write hidden block: `A8xx+crc`, `[16 bytes data]+crc`
   * Read configuration: `E000+crc`
   * Write configuration: `E100+crc`; `[16 bytes data]+crc`
+  * **Note:** Magic Auth capabilities vary between USCUID implementations. Some variants accept `E0/E1` configuration access but reject `38/A8` hidden-block access unless a Gen1a or GDM magic wakeup backdoor is enabled.
 
 * **DANGER**
   * Set main memory and config to 00 `F000+crc`
@@ -1112,7 +1113,7 @@ To enable an option, set it to 5A.
 *** SAK - if the perso byte is enabled, this SAK is ignored, and the SAK in the hidden block is used instead.
 ```
 
-* backdoor enable:                       The master on/off switch for the magic wakeup backdoor. Bytes 0-1 = `7AFF` enable it (with access to the config block), `8500` disable it. When disabled the tag has no wakeup backdoor, and only the Magic Auth command (if enabled, see below) can reach the backdoor commands. This is byte 0-1 in the parsed `gdmgetcfg` output ("Magic wakeup enabled/disabled"). Note the guide's default example above (`8500...`) has it disabled. Works with bitflip (`hint: 8500 XOR FFFF = 7AFF`).
+* backdoor enable:                       The master on/off switch for the magic wakeup backdoor. Bytes 0-1 = `7AFF` enable it (with access to the config block), `8500` disable it. When disabled the tag has no wakeup backdoor. Magic Auth may still provide configuration or other backdoor access when enabled, but the supported commands depend on the USCUID implementation. This is byte 0-1 in the parsed `gdmgetcfg` output ("Magic wakeup enabled/disabled"). Note the guide's default example above (`8500...`) has it disabled. Works with bitflip (`hint: 8500 XOR FFFF = 7AFF`).
 * backdoor style:                        Selects *which* wakeup command sequence enters the backdoor. A tag uses exactly one style, chosen by byte 2:
 
   | Byte 2 | Style            | Wakeup sequence               | Client flag |
@@ -1182,7 +1183,9 @@ No implemented commands today
 ### Variations
 
 ^[Top](#top)
-| Factory configuration            | Name          |
+These are observed factory configurations, not safe configuration presets. In particular, do not copy the `"7 byte hard"` configuration onto another card without first preparing valid 7-byte UID personalization data. Several factory values also disable the magic wakeup backdoor (`8500`); use `gdmsetcfg --wakestyle` instead of copying a row when changing the wakeup method.
+
+| Observed factory configuration   | Name          |
 | -------------------------------- | ------------- |
 | 850000000000000000005A5A00000008 | GDM           |
 | 850000000000005A00FF005A00000008 | GDCUID        |
