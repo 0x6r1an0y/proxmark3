@@ -10358,7 +10358,7 @@ static int CmdHF14AGen4_GDM_SetHidBlk(const char *Cmd) {
     } else {
         PrintAndLogEx(FAILED, "Write ( " _RED_("fail") " )");
     }
-    return PM3_SUCCESS;
+    return resp.status;
 }
 
 // Shared worker for gdmgetblk / gdmgethidblk: reads a single block (--blk) or a
@@ -10627,7 +10627,7 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
         }
         if (resp.status != PM3_SUCCESS) {
             PrintAndLogEx(FAILED, "Failed to write hidden block 0. Status: %d", resp.status);
-            return PM3_EFAILED;
+            return resp.status;
         }
         PrintAndLogEx(SUCCESS, "Hidden block 0 updated successfully");
     }
@@ -10641,7 +10641,7 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
     }
     if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "Failed to write real block %d. Status: %d", write_payload.block_no, resp.status);
-        return PM3_EFAILED;
+        return resp.status;
     }
     PrintAndLogEx(SUCCESS, "Real block %d updated successfully", write_payload.block_no);
 
