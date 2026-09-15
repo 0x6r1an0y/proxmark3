@@ -10620,10 +10620,65 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
     return PM3_SUCCESS;
 }
 
+static int gdm_wipe_write_block(const gdm_wakeup_t *w, uint8_t write_cmd, uint8_t block_no, const uint8_t *data) {
+    mf_writeblock_ex_t payload = {
+        .wakeup = w->wakeup_type,
+        .auth_cmd = w->auth_cmd,
+        .write_cmd = write_cmd,
+        .block_no = block_no
+    };
+    memcpy(payload.key, w->key, sizeof(payload.key));
+    memcpy(payload.block_data, data, sizeof(payload.block_data));
+
+    clearCommandBuffer();
+    SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&payload, sizeof(payload));
+
+    PacketResponseNG resp;
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false) {
+        PrintAndLogEx(FAILED, "Block %u write timed out", block_no);
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Block %u write failed. Status: %d", block_no, resp.status);
+        return resp.status;
+    }
+    return PM3_SUCCESS;
+}
+
+static int gdm_wipe_verify_uid(const uint8_t *expected_uid) {
+    clearCommandBuffer();
+    SendIso14aReader(ISO14A_CONNECT | ISO14A_CLEARTRACE | ISO14A_NO_DISCONNECT, NULL, 0);
+
+    PacketResponseNG resp;
+    uint8_t select_status = 0;
+    if (WaitForIso14aReply(&resp, 2500, NULL, &select_status) == false) {
+        DropField();
+        PrintAndLogEx(FAILED, "Could not select the card after writing the clean config");
+        return PM3_ETIMEOUT;
+    }
+
+    iso14a_card_select_t card;
+    memcpy(&card, resp.data.asBytes, sizeof(card));
+    DropField();
+
+    if (select_status == 0 || card.uidlen != 4 || memcmp(card.uid, expected_uid, 4) != 0) {
+        PrintAndLogEx(FAILED, "Clean UID verification failed");
+        if (select_status != 0) {
+            PrintAndLogEx(INFO, "Expected UID: %s", sprint_hex(expected_uid, 4));
+            PrintAndLogEx(INFO, "Selected UID: %s", sprint_hex(card.uid, card.uidlen));
+        }
+        return PM3_EFAILED;
+    }
+
+    PrintAndLogEx(SUCCESS, "Selected clean UID: %s", sprint_hex(card.uid, card.uidlen));
+    return PM3_SUCCESS;
+}
+
 static int CmdHF14AGen4_GDM_Wipe(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mf gdmwipe",
-                  "Wipe a GDM card to factory defaults.\n"
+                  "Reset a GDM card to a known clean 4-byte template.\n"
+                  "Sets UID 11223344, clears real and hidden data blocks, and restores transport sector trailers.\n"
                   "With no wakeup flag it auto-detects a backdoor (gen1a or gdm alt); a WUPA-only card is rejected.",
                   "hf mf gdmwipe --gdm"
                  );
@@ -10662,49 +10717,40 @@ static int CmdHF14AGen4_GDM_Wipe(const char *Cmd) {
     uint8_t auth_cmd = gw.auth_cmd;
     memcpy(key, gw.key, sizeof(key));
 
-    // Step 1: Write Config (gen1a + wupa + 4B UID)
-    uint8_t standard_config[MFBLOCK_SIZE] = {0x7A, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5A, 0x00, 0x00, 0x00, 0x08};
+    uint8_t clean_config[MFBLOCK_SIZE] = {0x7A, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5A, 0x00, 0x00, 0x00, 0x08};
     uint8_t cur_config[MFBLOCK_SIZE] = {0};
-    if (gdm_read_config(wakeup_type, auth_cmd, key, cur_config) == PM3_SUCCESS) {
-        standard_config[2] = cur_config[2];
+    if (gdm_read_config(wakeup_type, auth_cmd, key, cur_config) != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Cannot preserve the current wakeup style; no data was changed");
+        return PM3_EFAILED;
+    }
+    if (cur_config[2] == 0x00 || cur_config[2] == 0x85) {
+        clean_config[2] = cur_config[2];
     } else {
-        PrintAndLogEx(WARNING, "Could not read current config, keeping the default wakeup style");
+        clean_config[2] = (wakeup_type == MF_WAKE_GDM_ALT) ? 0x85 : 0x00;
+        PrintAndLogEx(WARNING, "Unknown wakeup style %02X; using %s", cur_config[2],
+                      clean_config[2] == 0x85 ? "gdm alt (20/23)" : "gen1a (40/43)");
     }
 
-    mf_writeblock_ex_t config_payload = {
-        .wakeup = wakeup_type,
-        .auth_cmd = auth_cmd,
-        .write_cmd = MIFARE_MAGIC_GDM_WRITE_CFG, // 0xE1
-        .block_no = 0
-    };
-    memcpy(config_payload.key, key, 6);
-    memcpy(config_payload.block_data, standard_config, MFBLOCK_SIZE);
-
-    clearCommandBuffer();
-    SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&config_payload, sizeof(config_payload));
-    PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false) {
-        PrintAndLogEx(FAILED, "Failed to write standard config: timeout");
-    } else if (resp.status != PM3_SUCCESS) {
-        PrintAndLogEx(FAILED, "Failed to write standard config. Status: %d", resp.status);
-    } else {
-        PrintAndLogEx(SUCCESS, "Standard config written");
-    }
-
-    // Step 2: Wipe sectors
     int max_sector = wipe_4k ? 40 : 16;
     uint8_t default_data[MFBLOCK_SIZE] = {0};
-    uint8_t default_trailer[MFBLOCK_SIZE] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x80, 0x69, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    uint8_t block0_data[MFBLOCK_SIZE] = {0xDE, 0x77, 0x15, 0xB8, 0x04, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-
-    mf_writeblock_ex_t write_payload = {
-        .wakeup = wakeup_type,
-        .auth_cmd = auth_cmd
-    };
-    memcpy(write_payload.key, key, 6);
+    uint8_t default_trailer[MFBLOCK_SIZE] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x80, 0x69, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    uint8_t block0_data[MFBLOCK_SIZE] = {0x11, 0x22, 0x33, 0x44, 0x44, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
     int failed_blocks = 0;
     int total_blocks = 0;
+    uint8_t verify_data[MFBLOCK_SIZE] = {0};
+
+    // Stage a valid 4-byte UID before changing the active UID source.
+    if (gdm_wipe_write_block(&gw, ISO14443A_CMD_WRITEBLOCK, 0, block0_data) != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Could not stage the clean block 0; config was not changed");
+        return PM3_EFAILED;
+    }
+    if (gdm_try_read(ISO14443A_CMD_READBLOCK, 0, &gw, verify_data) != PM3_SUCCESS ||
+            memcmp(verify_data, block0_data, MFBLOCK_SIZE) != 0) {
+        PrintAndLogEx(FAILED, "Clean block 0 readback failed; config was not changed");
+        return PM3_EPARTIAL;
+    }
+    total_blocks++;
 
     for (int sec = 0; sec < max_sector; sec++) {
         int first_blk = mfFirstBlockOfSector(sec);
@@ -10715,49 +10761,56 @@ static int CmdHF14AGen4_GDM_Wipe(const char *Cmd) {
             bool is_trailer = (blk == trailer_blk);
             uint8_t *data_to_write = is_trailer ? default_trailer : default_data;
 
-            // Real block writes
-            write_payload.write_cmd = ISO14443A_CMD_WRITEBLOCK; // 0xA0
-            write_payload.block_no = blk;
-            if (blk == 0) {
-                memcpy(write_payload.block_data, block0_data, MFBLOCK_SIZE);
-            } else {
-                memcpy(write_payload.block_data, data_to_write, MFBLOCK_SIZE);
+            if (blk != 0) {
+                if (gdm_wipe_write_block(&gw, ISO14443A_CMD_WRITEBLOCK, blk, data_to_write) != PM3_SUCCESS) {
+                    failed_blocks++;
+                }
+                total_blocks++;
             }
 
-            clearCommandBuffer();
-            SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&write_payload, sizeof(write_payload));
-            if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false || resp.status != PM3_SUCCESS) {
-                failed_blocks++;
+            // Hidden blocks 0 and 1 can still hold the active 7-byte/F3 UID.
+            if (blk > 1) {
+                const uint8_t *hidden_data = (blk == 7) ? MF_SIGNATURE_KEYS : data_to_write;
+                if (gdm_wipe_write_block(&gw, MIFARE_MAGIC_GDM_WRITEBLOCK, blk, hidden_data) != PM3_SUCCESS) {
+                    failed_blocks++;
+                }
+                total_blocks++;
             }
-
-            // Hidden block writes
-            write_payload.write_cmd = MIFARE_MAGIC_GDM_WRITEBLOCK; // 0xA8
-            if (blk == 7) {
-                memcpy(write_payload.block_data, MF_SIGNATURE_KEYS, MFBLOCK_SIZE);
-            }
-
-            clearCommandBuffer();
-            SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&write_payload, sizeof(write_payload));
-            if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false || resp.status != PM3_SUCCESS) {
-                failed_blocks++;
-            }
-            total_blocks += 2;
         }
         PrintAndLogEx(INFO, "Wiping sector %d...", sec);
     }
 
-    // report write failures instead of always printing "Wipe completed!"
-    if (failed_blocks == 0) {
-        PrintAndLogEx(SUCCESS, "Wipe completed!");
-        return PM3_SUCCESS;
+    if (failed_blocks != 0) {
+        PrintAndLogEx(FAILED, "Wipe incomplete - " _RED_("%d") " of %d pre-commit block writes failed", failed_blocks, total_blocks);
+        PrintAndLogEx(HINT, "Hint: config and active UID mode were left unchanged");
+        return PM3_EPARTIAL;
     }
 
-    PrintAndLogEx(FAILED, "Wipe incomplete - " _RED_("%d") " of %d block writes failed", failed_blocks, total_blocks);
-    if (failed_blocks == total_blocks) {
-        PrintAndLogEx(HINT, "Hint: the card did not accept any data write. Check that the wakeup still matches");
-        PrintAndLogEx(HINT, "      the card's config (`" _YELLOW_("hf mf gdmgetcfg") "`), then retry");
+    // Commit the 4-byte personality only after its UID source is valid.
+    if (gdm_write_config(wakeup_type, auth_cmd, key, clean_config) != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Clean config was not committed; the card was partially wiped");
+        return PM3_EPARTIAL;
     }
-    return PM3_EFAILED;
+    PrintAndLogEx(SUCCESS, "Clean config written");
+
+    if (gdm_wipe_verify_uid(block0_data) != PM3_SUCCESS) {
+        PrintAndLogEx(HINT, "Hint: the magic wakeup remains enabled for recovery");
+        return PM3_EPARTIAL;
+    }
+
+    // The clean 4-byte personality no longer uses hidden UID data.
+    for (uint8_t blk = 0; blk <= 1; blk++) {
+        if (gdm_wipe_write_block(&gw, MIFARE_MAGIC_GDM_WRITEBLOCK, blk, default_data) != PM3_SUCCESS) {
+            failed_blocks++;
+        }
+    }
+    if (failed_blocks != 0) {
+        PrintAndLogEx(FAILED, "Clean 4-byte mode is active, but hidden UID cleanup failed");
+        return PM3_EPARTIAL;
+    }
+
+    PrintAndLogEx(SUCCESS, "Wipe completed using the clean 4-byte template");
+    return PM3_SUCCESS;
 }
 
 static int CmdHF14AGen4_GDM_SetSig(const char *Cmd) {
@@ -12310,7 +12363,7 @@ static command_t CommandTable[] = {
     {"gdmgethidblk", CmdHF14AGen4_GDM_GetHidBlk, IfPm3Iso14443a, "Read hidden block from GDM card"},
     {"gdmsethidblk", CmdHF14AGen4_GDM_SetHidBlk, IfPm3Iso14443a, "Write hidden block to GDM card"},
     {"gdmsetuid", CmdHF14AGen4_GDM_SetUid, IfPm3Iso14443a, "Set UID on GDM card"},
-    {"gdmwipe", CmdHF14AGen4_GDM_Wipe, IfPm3Iso14443a, "Wipe GDM card to factory defaults"},
+    {"gdmwipe", CmdHF14AGen4_GDM_Wipe, IfPm3Iso14443a, "Reset GDM card to a clean template"},
     {"gdmsetsig", CmdHF14AGen4_GDM_SetSig, IfPm3Iso14443a, "Set MFC EV1 signature on GDM card"},
     {"-----------", CmdHelp,                IfPm3Iso14443a,  "----------------------- " _CYAN_("ndef") " -----------------------"},
     {"ndefformat",  CmdHFMFNDEFFormat,      IfPm3Iso14443a,  "Format MIFARE Classic Tag as NFC Tag"},
