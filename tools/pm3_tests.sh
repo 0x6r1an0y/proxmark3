@@ -299,6 +299,7 @@ while true; do
       if ! CheckExecute "findbits_test test"               "$PYTHON tools/findbits_test.py 2>&1" "OK"; then break; fi
       if ! CheckExecute "dfc_converter test"               "$PYTHON tools/dfc_converter_test.py 2>&1" "OK"; then break; fi
       if ! CheckExecute "pm3_eml_mfd test"                 "$PYTHON tools/mfc/pm3_eml_mfd_test.py 2>&1" "OK"; then break; fi
+      if ! CheckExecute "GDM UID/ATQA regression"           "$PYTHON tools/mfc/test_gdm_setuid.py 2>&1" "GDM UID/ATQA regression tests passed"; then break; fi
       if ! CheckExecute "recover_pk test"                  "$PYTHON tools/recover_pk.py selftests 2>&1" "Tests:.*\(.*ok.*"; then break; fi
       if ! CheckExecute "mkversion create test"            "tools/mkversion.sh --short" 'Iceman/'; then break; fi
     fi

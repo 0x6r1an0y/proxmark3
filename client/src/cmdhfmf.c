@@ -10566,6 +10566,22 @@ static void gdm_build_uid7_block0(const uint8_t *uid, uint8_t *block) {
     block[8] = 0x44;
 }
 
+static void gdm_build_uid_bridge(gdm_uid_source_t old_source, gdm_uid_source_t new_source,
+                                 const uint8_t *current, const uint8_t *target, uint8_t *bridge) {
+    if (new_source == GDM_UID_SOURCE_BLOCK0) {
+        memcpy(bridge, target, MFBLOCK_SIZE);
+        if (old_source != GDM_UID_SOURCE_BLOCK0) {
+            // Keep the old personality's ATQA until config switches to 4B.
+            memcpy(bridge + 8, current + 8, 2);
+        }
+    } else {
+        memcpy(bridge, current, MFBLOCK_SIZE);
+        // F3 and CL2 use real block 0 bytes 8-9, not hidden UID storage.
+        bridge[8] = (new_source == GDM_UID_SOURCE_HIDDEN0) ? 0x44 : 0x04;
+        bridge[9] = 0x00;
+    }
+}
+
 static int gdm_write_data_block(const gdm_wakeup_t *w, uint8_t write_cmd,
                                 uint8_t block_no, const uint8_t *data) {
     mf_writeblock_ex_t payload = {
@@ -10740,10 +10756,25 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
         gdm_build_uid4_block(uid, uid4_block);
     }
 
+    uint8_t current_block0[MFBLOCK_SIZE];
+    int res = gdm_try_read(ISO14443A_CMD_READBLOCK, 0, &gw, current_block0);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Could not read real block 0; no data was changed");
+        return res;
+    }
+    uint8_t bridge_block0[MFBLOCK_SIZE];
+    gdm_build_uid_bridge(old_source, new_source, current_block0, uid4_block, bridge_block0);
+    const uint8_t *final_block0 = uid4_block;
+    if (new_source == GDM_UID_SOURCE_HIDDEN0) {
+        final_block0 = uid7_block0;
+    } else if (new_source == GDM_UID_SOURCE_HIDDEN1) {
+        final_block0 = bridge_block0;
+    }
+
     uint8_t write_cmd = ISO14443A_CMD_WRITEBLOCK;
     uint8_t read_cmd = ISO14443A_CMD_READBLOCK;
     uint8_t source_block = 0;
-    const uint8_t *source_data = uid4_block;
+    const uint8_t *source_data = bridge_block0;
     if (new_source == GDM_UID_SOURCE_HIDDEN0) {
         write_cmd = MIFARE_MAGIC_GDM_WRITEBLOCK;
         read_cmd = MIFARE_MAGIC_GDM_READBLOCK;
@@ -10752,13 +10783,15 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
         write_cmd = MIFARE_MAGIC_GDM_WRITEBLOCK;
         read_cmd = MIFARE_MAGIC_GDM_READBLOCK;
         source_block = 1;
+        source_data = uid4_block;
     }
-    int res = gdm_stage_uid_block(&gw, write_cmd, read_cmd, source_block,
-                                  source_data, gdm_uid_source_name(new_source));
+    res = gdm_stage_uid_block(&gw, write_cmd, read_cmd, source_block,
+                              source_data, gdm_uid_source_name(new_source));
     if (res != PM3_SUCCESS) {
         if (gdm_write_result_unknown(res)) {
             PrintAndLogEx(WARNING, "The UID source write result is unknown; card storage may be partially updated");
             PrintAndLogEx(HINT, "Do not retry blindly; re-read the card state before attempting recovery");
+            return PM3_EPARTIAL;
         } else if (res == PM3_EPARTIAL) {
             PrintAndLogEx(WARNING, "The UID source was written, but its readback was not verified");
             PrintAndLogEx(HINT, "The config was not changed yet, but UID storage may be changed; verify card state before retrying");
@@ -10766,6 +10799,15 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
             PrintAndLogEx(HINT, "The UID source write was rejected; the config was not changed");
         }
         return res;
+    }
+
+    if (new_source != GDM_UID_SOURCE_BLOCK0 && memcmp(current_block0, bridge_block0, MFBLOCK_SIZE) != 0) {
+        res = gdm_stage_uid_block(&gw, ISO14443A_CMD_WRITEBLOCK, ISO14443A_CMD_READBLOCK,
+                                  0, bridge_block0, "real block 0 ATQA bridge");
+        if (res != PM3_SUCCESS) {
+            PrintAndLogEx(WARNING, "UID storage may be changed, but the ATQA bridge was not verified; config was not changed");
+            return PM3_EPARTIAL;
+        }
     }
 
     uint8_t target_perso = 0x00;
@@ -10790,6 +10832,12 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
             PrintAndLogEx(INFO, "The staged UID data remains in storage and may be reused after recovery");
             return res;
         }
+        uint8_t verify_config[MFBLOCK_SIZE];
+        if (gdm_read_config(wakeup_type, auth_cmd, key, verify_config) != PM3_SUCCESS ||
+                memcmp(config, verify_config, MFBLOCK_SIZE) != 0) {
+            PrintAndLogEx(WARNING, "UID storage was prepared, but the config update could not be verified");
+            return PM3_EPARTIAL;
+        }
     }
 
     uint8_t verify_uid[10] = {0};
@@ -10800,15 +10848,16 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
         PrintAndLogEx(HINT, "The card state is partial; re-read config and UID storage before attempting recovery");
         return PM3_EPARTIAL;
     }
-    PrintAndLogEx(SUCCESS, "New UID... %s ( " _GREEN_("verified") " )", sprint_hex(verify_uid, verify_uidlen));
-
-    bool partial = false;
-    if (new_source == GDM_UID_SOURCE_HIDDEN0) {
+    if (memcmp(bridge_block0, final_block0, MFBLOCK_SIZE) != 0) {
         res = gdm_stage_uid_block(&gw, ISO14443A_CMD_WRITEBLOCK, ISO14443A_CMD_READBLOCK,
-                                  0, uid7_block0, "7-byte real block 0 representation");
-        partial = (res != PM3_SUCCESS);
+                                  0, final_block0, "final real block 0 representation");
+        if (res != PM3_SUCCESS) {
+            PrintAndLogEx(WARNING, "UID changed, but final real block 0 was not verified; hidden UID cleanup was skipped");
+            return PM3_EPARTIAL;
+        }
     }
 
+    bool partial = false;
     uint8_t empty_block[MFBLOCK_SIZE] = {0};
     if (old_source == GDM_UID_SOURCE_HIDDEN0 && new_source != old_source) {
         res = gdm_stage_uid_block(&gw, MIFARE_MAGIC_GDM_WRITEBLOCK, MIFARE_MAGIC_GDM_READBLOCK,
@@ -10820,10 +10869,15 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
         partial = partial || (res != PM3_SUCCESS);
     }
 
+    if (gdm_verify_selected_uid(uid, uidlen, verify_uid, &verify_uidlen) != PM3_SUCCESS) {
+        PrintAndLogEx(WARNING, "Card selection failed after finalizing the UID update; use the magic backdoor for recovery");
+        return PM3_EPARTIAL;
+    }
     if (partial) {
         PrintAndLogEx(WARNING, "UID change verified, but post-commit cleanup was incomplete");
         return PM3_EPARTIAL;
     }
+    PrintAndLogEx(SUCCESS, "New UID... %s ( " _GREEN_("verified") " )", sprint_hex(verify_uid, verify_uidlen));
     return PM3_SUCCESS;
 }
 
