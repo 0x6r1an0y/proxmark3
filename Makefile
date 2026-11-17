@@ -38,11 +38,16 @@ endef
 HOST_TARGETS := client mfc_card_only mfc_card_reader mfd_aes_brute mfulc_des_brute fpga_compress cryptorf
 TARGETS := bootrom armsrc recovery $(HOST_TARGETS)
 all clean install uninstall check: %:
-	$(foreach target,$(TARGETS),$(call submake,$(target),$*))
+	+$(foreach target,$(TARGETS),$(call submake,$(target),$*))
+
+# client runtime leftovers, written to the directory the client was started in
+clean: clean-runtime
+clean-runtime:
+	$(Q)$(RM) hardnested_stats.txt
 
 host: host/all
 host/all host/clean host/install host/uninstall host/check: %:
-	$(foreach target,$(HOST_TARGETS),$(call submake,$(target),$(notdir $*)))
+	+$(foreach target,$(HOST_TARGETS),$(call submake,$(target),$(notdir $*)))
 
 INSTALLTOOLS=mfc/pm3_eml2lower.sh mfc/pm3_eml2upper.sh mfc/pm3_mfdread.py mfc/pm3_mfd2eml.py mfc/pm3_eml2mfd.py pm3_amii_bin2eml.pl pm3_reblay-emulating.py pm3_reblay-reading.py
 INSTALLSIMFW=sim011.bin sim011.sha512.txt sim013.bin sim013.sha512.txt sim020.bin sim020.sha512.txt
@@ -201,7 +206,7 @@ ePassport/%: FORCE
 
 FORCE: # Dummy target to force remake in the subdirectories, even if files exist (this Makefile doesn't know about the prerequisites)
 
-.PHONY: all host clean install uninstall help _test bootrom fullimage recovery client mfc_card_only mfc_card_reader mfulc_des_brute mfd_aes_brute hitag2crack ePassport style miscchecks release FORCE udev accessrights cleanifplatformchanged
+.PHONY: all host clean install uninstall help _test bootrom fullimage recovery client mfc_card_only mfc_card_reader mfulc_des_brute mfd_aes_brute hitag2crack ePassport style miscchecks release FORCE udev accessrights cleanifplatformchanged clean-runtime configure
 
 help:
 	@echo "Multi-OS Makefile"
@@ -233,6 +238,8 @@ help:
 	@echo "+ .../check       - Run offline tests against specific target. See above."
 	@echo "+ miscchecks      - Detect various encoding issues in source code"
 	@echo
+	@echo "+ configure       - Check this machine can build the project. Run it after cloning."
+	@echo "                    Set CONFIGUREARGS to pass arguments, e.g. CONFIGUREARGS=--install"
 	@echo "+ udev            - Sets udev rules on *nix"
 	@echo "+ accessrights    - Ensure user belongs to correct group on *nix"
 	@echo
@@ -300,6 +307,12 @@ endif
 	$(Q)$(ECHO) CACHED_PLATFORM_DEFS=$(PLATFORM_DEFS) >> .Makefile.options.cache
 endif
 
+# first-run check of the build environment: toolchains, client libraries,
+# Python venv and requirements, chosen PLATFORM, device access rights.
+# Set CONFIGUREARGS to pass arguments, e.g. CONFIGUREARGS=--install
+configure: FORCE
+	$(Q)$(BASH) configure_environment.sh $(CONFIGUREARGS)
+
 # configure system to ignore PM3 device as a modem (ModemManager blacklist, effective *only* if ModemManager is not using _strict_ policy)
 # Read doc/md/ModemManager-Must-Be-Discarded.md for more info
 udev:
@@ -337,7 +350,7 @@ style: commands
 	# Make sure astyle is installed
 	@command -v astyle >/dev/null || ( echo "Please install 'astyle' package first" ; exit 1 )
 	# Remove spaces & tabs at EOL, add LF at EOF if needed on *.c, *.h, *.cpp. *.lua, *.py, *.pl, Makefile, *.v, pm3
-	find . \( -not -path "./cov-int/*" -and -not -path "./fpga*/xst/*" -and -not -path "./venv*" -and \( -name "*.[ch]" -or \( -name "*.cpp" -and -not -name "*.moc.cpp" \) -or -name "*.lua" -or -name "*.py" -or -name "*.pl" -or -name "Makefile" -or -name "*.v" -or -name "pm3" \) \) \
+	find . \( -not -path "./cov-int/*" -and -not -path "./fpga*/xst/*" -and -not -path "./venv*" -and \( -name "*.[ch]" -or \( -name "*.cpp" -and -not -name "*.moc.cpp" \) -or -name "*.lua" -or -name "*.py" -or -name "*.pl" -or -name "Makefile" -or -name "*.v" -or \( -name "pm3" -and -type f \) \) \) \
 		-exec perl -pi -e 's/[ \t]+$$//' {} \; \
 		-exec sh -c "tail -c1 {} | xxd -p | tail -1 | grep -q -v 0a$$" \; \
 		-exec sh -c "echo >> {}" \;
@@ -354,13 +367,20 @@ style: commands
 		--style=google --unpad-paren --pad-header \
 		--align-pointer=name {} \;
 
+COMMANDS_UTF8_FILTER := cat
+COMMANDS_PYTHON := $(PYTHON3)
+ifdef IS_MINGW
+    COMMANDS_UTF8_FILTER := iconv -f CP850 -t UTF-8
+    COMMANDS_PYTHON := PYTHONIOENCODING=utf-8 $(PYTHON3)
+endif
+
 commands: client
 	# Update commands.md
-	[ -x client/proxmark3 ] && client/proxmark3 -m | tr -d '\r' > doc/commands.md
+	[ -x client/proxmark3 ] && client/proxmark3 -m | $(COMMANDS_UTF8_FILTER) | tr -d '\r' > doc/commands.md
 	# Make sure python3 is installed
-	@command -v python3 >/dev/null || ( echo "Please install 'python3' package first" ; exit 1 )
+	@command -v $(PYTHON3) >/dev/null || ( echo "Please install '$(PYTHON3)' package first" ; exit 1 )
 	# Update commands.json, patch port in case it was run under Windows
-	[ -x client/proxmark3 ] && client/proxmark3 --fulltext | sed 's#com[0-9]#/dev/ttyACM0#'|python3 client/pyscripts/pm3_help2json.py - - | tr -d '\r' > doc/commands.json
+	[ -x client/proxmark3 ] && client/proxmark3 --fulltext | $(COMMANDS_UTF8_FILTER) | sed 's#com[0-9]#/dev/ttyACM0#'|$(COMMANDS_PYTHON) client/pyscripts/pm3_help2json.py - - | tr -d '\r' > doc/commands.json
 
 
 # Detecting weird codepages and tabs.
@@ -376,7 +396,7 @@ miscchecks:
 # Make sure recode is installed
 	@command -v recode >/dev/null || ( echo "Please install 'recode' package first" ; exit 1 )
 	@echo "Files with suspicious chars:"
-	@find . \( -not -path "./cov-int/*" -and -not -path "./client/deps/*" -and -not -path "./venv*" -and \( -name "*.[ch]" -or -name "*.cpp" -or -name "*.lua" -or -name "*.py" -or -name "*.pl" -or -name "Makefile" -or -name "*.v" -or -name "pm3" \) \) \
+	@find . \( -not -path "./cov-int/*" -and -not -path "./client/deps/*" -and -not -path "./venv*" -and \( -name "*.[ch]" -or -name "*.cpp" -or -name "*.lua" -or -name "*.py" -or -name "*.pl" -or -name "Makefile" -or -name "*.v" -or \( -name "pm3" -and -type f \) \) \) \
 	      -exec sh -c "cat {} |recode utf8.. >/dev/null || echo {}" \;
 ifneq (,$(EDIT))
 	@echo "Files with tabs: (EDIT enabled, files will be rewritten!)"
@@ -384,7 +404,7 @@ else
 	@echo "Files with tabs: (rerun with EDIT=1 if you want to convert them with vim)"
 endif
 # to remove tabs within lines, one can try with: vi $file -c ':set tabstop=4' -c ':set et|retab' -c ':wq'
-	@find . \( -not -path "./cov-int/*" -and -not -path "./client/deps/*" -and -not -path "./venv*" -and -not -wholename "./client/src/pm3_*wrap.c" -and \( -name "*.[ch]" -or \( -name "*.cpp" -and -not -name "*.moc.cpp" \) -or -name "*.lua" -or -name "*.py" -or -name "*.pl" -or -name "*.md" -or -name "*.txt" -or -name "*.awk" -or -name "*.v" -or -name "pm3" \) \) \
+	@find . \( -not -path "./cov-int/*" -and -not -path "./client/deps/*" -and -not -path "./venv*" -and -not -wholename "./client/src/pm3_*wrap.c" -and \( -name "*.[ch]" -or \( -name "*.cpp" -and -not -name "*.moc.cpp" \) -or -name "*.lua" -or -name "*.py" -or -name "*.pl" -or -name "*.md" -or -name "*.txt" -or -name "*.awk" -or -name "*.v" -or \( -name "pm3" -and -type f \) \) \) \
 	      -exec sh -c "$(TABSCMD)" \;
 #	@echo "Files with printf \\\\t:"
 #	@find . \( -name "*.[ch]" -or \( -name "*.cpp" -and -not -name "*.moc.cpp" \) -or -name "*.lua" -or -name "*.py" -or -name "*.pl" -or -name "*.md" -or -name "*.txt" -or -name "*.awk" -or -name "*.v" \) \

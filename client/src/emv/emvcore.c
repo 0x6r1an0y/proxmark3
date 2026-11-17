@@ -207,9 +207,14 @@ static void aidlist_rule(char *dst, size_t dstlen, size_t w_aid, size_t w_prio, 
 
     dst[pos++] = '+';
     for (size_t c = 0; c < 3; c++) {
-        for (size_t i = 0; (i < widths[c] + 2) && (pos + 2 < dstlen); i++) {
-            dst[pos++] = '-';
+        // memset, not a byte loop: gcc's AVX2 vectorized loop trips -Wstringop-overflow
+        size_t n = widths[c] + 2;
+        size_t room = (pos + 2 < dstlen) ? dstlen - pos - 2 : 0;
+        if (n > room) {
+            n = room;
         }
+        memset(dst + pos, '-', n);
+        pos += n;
         if (pos + 1 < dstlen) {
             dst[pos++] = '+';
         }
@@ -575,9 +580,9 @@ int EMVSearchPSE(Iso7816CommandChannel channel, bool ActivateField, bool LeaveFi
         if ((res < 0) && (channel == CC_CONTACT)) {
             smart_card_atr_t atr;
             if (smart_select(false, &atr)) {
-                PrintAndLogEx(HINT, "Hint: card answered its ATR but not the APDU - is this an EMV card? try `" _YELLOW_("smart info") "`");
+                PrintAndLogEx(HINT, "Hint: Is this an EMV card? Try `" _YELLOW_("smart info") "`");
             } else {
-                PrintAndLogEx(HINT, "Hint: no answer at all - is a card in the slot? try `" _YELLOW_("smart info") "`");
+                PrintAndLogEx(HINT, "Hint: Is a card in the slot? Try `" _YELLOW_("smart info") "`");
             }
         }
     }

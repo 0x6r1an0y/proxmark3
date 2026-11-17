@@ -39,6 +39,7 @@
 #include "util_posix.h"  // msleep, msclock
 #include "jansson.h"
 #include "jsonutils.h"
+#include "parsers/parsetransit.h"  // transit card parsers
 
 
 #define FELICA_BLK_SIZE 16
@@ -66,6 +67,8 @@
 #define FELICA_OPTIONAL_CMD_RETRIES 3U
 // Per FeliCa spec, Polling max response at 16 timeslots is ~25ms; keep extra margin.
 #define FELICA_POLLING_TIMEOUT_MS 100U
+#define FELICA_READER_SYSTEM_POLL_TIMEOUT_MS 2500U
+#define FELICA_READER_SYSTEM_POLL_ATTEMPTS 4U
 #define FELICA_SEAC_POLL_TIMEOUT_MS 200U
 #define FELICA_SEAC_POLL_RETRY_COUNT 5U
 #define FELICA_SEAC_POLL_FRAME_LEN 6U
@@ -137,6 +140,11 @@ static bool felica_is_lite_assumed_node(uint16_t node_code_le) {
 
 static bool felica_is_lite_ic_type(uint8_t ic_type) {
     return (ic_type == 0xF0 || ic_type == 0xF1);
+}
+
+static bool felica_pmm_is_sd2_or_newer(const uint8_t *pmm) {
+    // SD2+ officially starts with 0x44, but 0x38/0x3B also express those features
+    return (pmm != NULL && (pmm[1] == 0x38 || pmm[1] == 0x3B || (pmm[1] >= 0x44 && pmm[1] <= 0x7F)));
 }
 
 static bool felica_pmm_is_lite(const uint8_t *pmm) {
@@ -466,6 +474,7 @@ typedef enum {
 
 static int CmdHelp(const char *Cmd);
 static void clear_and_send_command(uint8_t flags, uint16_t datalen, uint8_t *data, bool verbose);
+static void clear_and_send_command_ex(uint8_t flags, uint16_t datalen, uint8_t *data, uint16_t numbits, bool verbose, bool normalize_frame);
 static int send_felica_payload_with_retries(uint8_t flags, uint16_t datalen, uint8_t *data, bool verbose,
                                             int expected_response_cmd, uint32_t timeout_ms, uint32_t retries, uint32_t backoff_ms, bool logging,
                                             PacketResponseNG *resp, const char *request_name);
@@ -550,10 +559,10 @@ static void print_status_flag1_interpretation(void) {
     PrintAndLogEx(INFO, "----+--------------------------------------------------------------------------------------------------------------------");
     PrintAndLogEx(INFO, " 00 | Indicates the successful completion of a command.");
     PrintAndLogEx(INFO, " FF | If an error occurs during the processing of a command that includes no list in the command packet, \n"
-                        "    | or if an error occurs independently of any list, the card returns a response by setting FFh to Status Flag1.");
+                  "    | or if an error occurs independently of any list, the card returns a response by setting FFh to Status Flag1.");
     PrintAndLogEx(INFO, " XX | If an error occurs while processing a command that includes Service Code List or Block List \n"
-                        "    | in the command packet, the card returns a response by setting a number in the list to Status Flag1,\n"
-                        "    | indicating the location of the error.");
+                  "    | in the command packet, the card returns a response by setting a number in the list to Status Flag1,\n"
+                  "    | indicating the location of the error.");
     PrintAndLogEx(INFO, "----+--------------------------------------------------------------------------------------------------------------------");
 }
 
@@ -562,28 +571,28 @@ static void print_status_flag2_interpration(void) {
     PrintAndLogEx(INFO, "----+--------------------------------------------------------------------------------------------------------------------");
     PrintAndLogEx(INFO, " 00 | Indicates the successful completion of a command.");
     PrintAndLogEx(INFO, " 01 | The calculated result is either less than zero when the purse data is decremented, or exceeds 4\n"
-                        "    | Bytes when the purse data is incremented.");
+                  "    | Bytes when the purse data is incremented.");
     PrintAndLogEx(INFO, " 02 | The specified data exceeds the value of cashback data at cashback of purse.");
     PrintAndLogEx(INFO, " 70 | Memory error (fatal error).");
     PrintAndLogEx(INFO, " 71 | The number of memory rewrites exceeds the upper limit (this is only a warning; data writing is performed as normal).\n"
-                        "    | The maximum number of rewrites can differ, depending on the product being used.\n"
-                        "    | In addition, Status Flag1 is either 00h or FFh depending on the product being used.");
+                  "    | The maximum number of rewrites can differ, depending on the product being used.\n"
+                  "    | In addition, Status Flag1 is either 00h or FFh depending on the product being used.");
 
     PrintAndLogEx(INFO, " A1 | Illegal Number of Service| Number of Service or Number of Node specified by the command \n"
-                        "    | falls outside the range of the prescribed value.");
+                  "    | falls outside the range of the prescribed value.");
     PrintAndLogEx(INFO, " A2 | Illegal command packet (specified Number of Block) : Number of Block specified by the \n"
-                        "    | command falls outside the range of the prescribed values for the product.");
+                  "    | command falls outside the range of the prescribed values for the product.");
     PrintAndLogEx(INFO, " A3 | Illegal Block List (specified order of Service) : Service Code List Order specified by \n"
-                        "    | Block List Element falls outside the Number of Service specified by the command \n"
-                        "    | (or the Number of Service specified at the times of mutual authentication).");
+                  "    | Block List Element falls outside the Number of Service specified by the command \n"
+                  "    | (or the Number of Service specified at the times of mutual authentication).");
     PrintAndLogEx(INFO, " A4 | Illegal Service type : Area Attribute specified by the command or Service Attribute of Service Code is incorrect.");
     PrintAndLogEx(INFO, " A5 | Access is not allowed : Area or Service specified by the command cannot be accessed.\n"
-                        "    | The parameter specified by the command does not satisfy the conditions for success.");
+                  "    | The parameter specified by the command does not satisfy the conditions for success.");
     PrintAndLogEx(INFO, " A6 | Illegal Service Code List : Target to be accessed, identified by Service Code List Order, specified by Block\n"
-                        "    | List Element does not exist. Or, Node specified by Node Code List does not exist.");
+                  "    | List Element does not exist. Or, Node specified by Node Code List does not exist.");
     PrintAndLogEx(INFO, " A7 | Illegal Block List (Access Mode) : Access Mode specified by Block List Element is incorrect.");
     PrintAndLogEx(INFO, " A8 | Illegal Block Number Block Number (access to the specified data is inhibited) :\n"
-                        "    | specified by Block List Element exceeds the number of Blocks assigned to Service.");
+                  "    | specified by Block List Element exceeds the number of Blocks assigned to Service.");
     PrintAndLogEx(INFO, " A9 | Data write failure : This is the error that occurs in issuance commands.");
     PrintAndLogEx(INFO, " AA | Key-change failure : Key change failed.");
     PrintAndLogEx(INFO, " AB | Illegal Package Parity or illegal Package MAC : This is the error that occurs in issuance commands.");
@@ -591,7 +600,7 @@ static void print_status_flag2_interpration(void) {
     PrintAndLogEx(INFO, " AD | Service exists already : This is the error that occurs in issuance commands.");
     PrintAndLogEx(INFO, " AE | Illegal System Code : This is the error that occurs in issuance commands.");
     PrintAndLogEx(INFO, " AF | Too many simultaneous cyclic write operations : Number of simultaneous write Blocks\n"
-                        "    | specified by the command to Cyclic Service exceeds the number of Blocks assigned to Service.");
+                  "    | specified by the command to Cyclic Service exceeds the number of Blocks assigned to Service.");
     PrintAndLogEx(INFO, " C0 | Illegal Package Identifier : This is the error that occurs in issuance commands.");
     PrintAndLogEx(INFO, " C1 | Discrepancy of parameters inside and outside Package : This is the error that occurs in issuance commands.");
     PrintAndLogEx(INFO, " C2 | Command is disabled already : This is the error that occurs in issuance commands.");
@@ -615,16 +624,16 @@ static void print_number_of_service_constraints(void) {
 
 static void print_number_of_block_constraints(void) {
     PrintAndLogEx(INFO, "    - Number of Block: shall be less than or equal to the maximum number of Blocks that can be read simultaneously.\n"
-                        "            The maximum number of Blocks that can be read simultaneously can differ, depending on the product being used.\n"
-                        "            Use as default 01");
+                  "            The maximum number of Blocks that can be read simultaneously can differ, depending on the product being used.\n"
+                  "            Use as default 01");
 }
 
 static void print_service_code_list_constraints(void) {
     PrintAndLogEx(INFO, "    - Service Code List: For Service Code List, only Service Code existing in the product shall be specified:");
     PrintAndLogEx(INFO, "        - Even when Service Code exists in the product, Service Code not referenced from Block List shall not \n"
-                        "          be specified to Service Code List.");
+                  "          be specified to Service Code List.");
     PrintAndLogEx(INFO, "        - For existence or nonexistence of Service in a product, please check using the Request Service \n"
-                        "          (or Request Service v2) command.");
+                  "          (or Request Service v2) command.");
 }
 
 /*
@@ -1937,8 +1946,8 @@ static void felica_info_process_system_services(int level, uint8_t flags,
             json_t *data_json = json_object_get(node_json, "data");
             const bool has_data_matchers = json_is_object(data_json) && (json_object_size(data_json) > 0);
             const size_t matcher_count = felica_parse_service_node_matchers(node_json,
-                nodes[node_count].matchers,
-                ARRAYLEN(nodes[node_count].matchers));
+                                         nodes[node_count].matchers,
+                                         ARRAYLEN(nodes[node_count].matchers));
             if (has_data_matchers && matcher_count == 0) {
                 continue;
             }
@@ -2345,9 +2354,9 @@ static int discover_systems(uint8_t flags, const uint8_t *primary_idm,
         for (uint32_t attempt = 0; attempt < attempts; attempt++) {
             felica_syscode_response_t system_code_response;
             const int request_system_code_status = send_request_system_code(flags,
-                sizeof(request_system_code_request), (uint8_t *)&request_system_code_request,
-                false, FELICA_OPTIONAL_CMD_TIMEOUT_MS, 0, false,
-                &system_code_response);
+                                                   sizeof(request_system_code_request), (uint8_t *)&request_system_code_request,
+                                                   false, FELICA_OPTIONAL_CMD_TIMEOUT_MS, 0, false,
+                                                   &system_code_response);
 
             if (request_system_code_status != PM3_SUCCESS) {
                 continue;
@@ -2380,20 +2389,38 @@ static int discover_systems(uint8_t flags, const uint8_t *primary_idm,
                                             primary_system_code, primary_idm_polled, primary_pmm_polled);
     }
 
-    if (got_system_code_list == false) {
-        for (size_t i = 0; i < ARRAYLEN(FELICA_MANUAL_SYSTEM_PROBE_TARGETS); i++) {
-            uint8_t probed_idm[8] = {0};
-            uint8_t probed_pmm[8] = {0};
-            const uint16_t system_code = FELICA_MANUAL_SYSTEM_PROBE_TARGETS[i].system_code;
-            if (send_polling(flags, system_code, FELICA_POLLING_REQUEST_NO_DATA,
-                             FELICA_POLLING_TIMEOUT_MS, polling_retries, false,
-                             probed_idm, probed_pmm, NULL) != PM3_SUCCESS) {
-                continue;
+    // Probe systems manually, for the following reasons:
+    // * FeliCa Lite cards do not support RequestSystemCode
+    // * FeliCa Standard SD2 cards may host independent Lite/Secure ID environments
+    //   not discoverable through RequestSystemCode
+    bool probe_selected = false;
+    const bool probe_allowed = got_system_code_list == false ||
+                               felica_pmm_is_lite(primary_pmm_polled) ||
+                               felica_pmm_is_sd2_or_newer(primary_pmm_polled);
+    for (size_t i = 0; probe_allowed && i < ARRAYLEN(FELICA_MANUAL_SYSTEM_PROBE_TARGETS); i++) {
+        const uint16_t system_code = FELICA_MANUAL_SYSTEM_PROBE_TARGETS[i].system_code;
+        bool known = false;
+        for (size_t j = 0; j < discovered_systems->count; j++) {
+            if (discovered_systems->systems[j].system_code == system_code) {
+                known = true;
+                break;
             }
-
-            felica_add_unique_discovered_system(discovered_systems->systems, &discovered_systems->count,
-                                                system_code, probed_idm, probed_pmm);
         }
+        if (known) {
+            continue;
+        }
+
+        uint8_t probed_idm[8] = {0};
+        uint8_t probed_pmm[8] = {0};
+        if (send_polling(flags, system_code, FELICA_POLLING_REQUEST_NO_DATA,
+                         FELICA_POLLING_TIMEOUT_MS, polling_retries, false,
+                         probed_idm, probed_pmm, NULL) != PM3_SUCCESS) {
+            continue;
+        }
+
+        felica_add_unique_discovered_system(discovered_systems->systems, &discovered_systems->count,
+                                            system_code, probed_idm, probed_pmm);
+        probe_selected = true;
     }
 
     if (discovered_systems->count == 0) {
@@ -2431,6 +2458,15 @@ static int discover_systems(uint8_t flags, const uint8_t *primary_idm,
         write_index++;
     }
     discovered_systems->count = write_index;
+
+    // For SD2 cards, dedicated environments may have a more limited command set
+    // so we reselect the main Standard system
+    if (probe_selected && felica_pmm_is_sd2_or_newer(primary_pmm_polled)) {
+        uint8_t reselect_idm[8] = {0};
+        send_polling(flags, FELICA_SYSTEM_CODE_WILDCARD, FELICA_POLLING_REQUEST_NO_DATA,
+                     FELICA_POLLING_TIMEOUT_MS, polling_retries, false,
+                     reselect_idm, NULL, NULL);
+    }
 
     if (discovered_systems->count == 0) {
         return PM3_ERFTRANS;
@@ -2685,27 +2721,79 @@ int read_felica_uid(bool loop, bool verbose) {
     return res;
 }
 
+static int read_felica_system(uint16_t system_code, bool loop, bool verbose) {
+    uint8_t system_bytes[2];
+    felica_system_code_to_bytes(system_code, system_bytes);
+    const uint8_t flags = FELICA_CONNECT | FELICA_CLEARTRACE | FELICA_NO_DISCONNECT | FELICA_SYSTEM_SELECT;
+    int res = PM3_ETIMEOUT;
+
+    for (uint32_t attempt = 0; loop || attempt < FELICA_READER_SYSTEM_POLL_ATTEMPTS; attempt++) {
+        clear_and_send_command_ex(flags, sizeof(system_bytes), system_bytes, 0, false, false);
+        PacketResponseNG resp;
+        if (WaitForResponseTimeout(CMD_HF_FELICA_COMMAND, &resp, FELICA_READER_SYSTEM_POLL_TIMEOUT_MS) &&
+                resp.status == PM3_SUCCESS && resp.length >= sizeof(felica_card_select_t)) {
+            felica_card_select_t card;
+            memcpy(&card, resp.data.asBytes, sizeof(card));
+            set_last_known_card(card);
+            if (verbose) {
+                PrintAndLogEx(SUCCESS, "IDm: " _GREEN_("%s"), sprint_hex_inrow(card.IDm, sizeof(card.IDm)));
+            }
+            res = PM3_SUCCESS;
+            if (loop == false) {
+                break;
+            }
+        }
+        if (kbd_enter_pressed()) {
+            if (res != PM3_SUCCESS) {
+                res = PM3_EOPABORTED;
+            }
+            break;
+        }
+    }
+
+    DropField();
+    return res;
+}
+
 static int CmdHFFelicaReader(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf felica reader",
                   "Act as a ISO 18092 / FeliCa reader. Look for FeliCa tags until Enter or the pm3 button is pressed",
-                  "hf felica reader -@    -> Continuous mode");
+                  "hf felica reader -@\n"
+                  "hf felica reader --sys 0003 -@    -> Continuous polling for system 0003");
 
     void *argtable[] = {
         arg_param_begin,
         arg_lit0("s", "silent", "silent (no messages)"),
         arg_lit0("@", NULL, "optional - continuous reader mode"),
+        arg_str0(NULL, "sys", "<hex>", "poll a specific 2-byte system code (4 attempts, or continuous with -@)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
     bool verbose = (arg_get_lit(ctx, 1) == false);
     bool cm = arg_get_lit(ctx, 2);
+    struct arg_str *system_arg = arg_get_str(ctx, 3);
+    bool has_system = system_arg->count > 0;
+    uint8_t system_bytes[2] = {0};
+    int system_len = 0;
+    int parse_status = has_system ? CLIParamHexToBuf(system_arg, system_bytes, sizeof(system_bytes), &system_len) : PM3_SUCCESS;
+    bool invalid_system = parse_status != PM3_SUCCESS ||
+                          (has_system && (strlen(system_arg->sval[0]) != 4 || system_len != 2));
     CLIParserFree(ctx);
+
+    if (invalid_system) {
+        PrintAndLogEx(ERR, "System code must be exactly 4 hex digits");
+        return PM3_EINVARG;
+    }
 
     if (cm) {
         PrintAndLogEx(INFO, "Press " _GREEN_("<Enter>") " to exit");
     }
 
+    if (has_system) {
+        uint16_t system_code = felica_system_code_from_bytes(system_bytes);
+        return read_felica_system(system_code, cm, verbose);
+    }
     return read_felica_uid(cm, verbose);
 }
 
@@ -3120,6 +3208,18 @@ static int info_felica(bool verbose, bool no_ic_optimizations) {
         PrintAndLogEx(INFO, "Systems........ " _GREEN_("%u:"), (unsigned int)discovered_systems.count);
         for (size_t i = 0; i < discovered_systems.count; i++) {
             felica_info_process_system(INFO, optional_flags, &discovered_systems.systems[i], &auth_keys, &caps, verbose);
+        }
+
+        uint16_t codes[FELICA_DISCOVERED_SYSTEM_MAX_COUNT];
+        size_t ncodes = 0;
+        for (size_t i = 0; i < discovered_systems.count && ncodes < ARRAYLEN(codes); i++) {
+            codes[ncodes++] = discovered_systems.systems[i].system_code;
+        }
+        transit_idents_t transit_ids;
+        if (transit_felica_identify(codes, ncodes, &transit_ids) > 0) {
+            PrintAndLogEx(NORMAL, "");
+            transit_print_idents(&transit_ids);
+            transit_print_ident_hints(&transit_ids, NULL);
         }
     }
 
@@ -5152,7 +5252,7 @@ static int felica_discover_nodes(const uint8_t *idm,
         bool discovered = false;
         if (info->method == FELICA_NODE_DISCOVERY_READ_WITHOUT_ENCRYPTION) {
             discovered = felica_discover_nodes_with_read_without_encryption_ex(flags, idm, retry_count, pmm,
-                visitor, ctx, &discovered_count, &stop_status);
+                         visitor, ctx, &discovered_count, &stop_status);
         } else {
             discovered = info->run(flags, idm, retry_count, visitor, ctx, &discovered_count, &stop_status);
         }
@@ -5313,13 +5413,12 @@ static void felica_scsvcode_print_footer(const felica_scsvcode_context_t *scsv_c
         return;
     }
 
-    char bar[128];
-    size_t pos = 0;
-    pos += snprintf(bar + pos, sizeof(bar) - pos, "└");
-    for (int i = 0; i < scsv_ctx->depth - 1 && pos < sizeof(bar); i++) {
-        pos += snprintf(bar + pos, sizeof(bar) - pos, "───┴");
+    char bar[128] = {0};
+    str_append(bar, sizeof(bar), "└");
+    for (int i = 0; i < scsv_ctx->depth - 1; i++) {
+        str_append(bar, sizeof(bar), "───┴");
     }
-    snprintf(bar + pos, sizeof(bar) - pos, "───────────────────────");
+    str_append(bar, sizeof(bar), "───────────────────────");
     PrintAndLogEx(INFO, "%s", bar);
 }
 
@@ -5348,6 +5447,60 @@ static void felica_dump_systems_free(felica_dump_system_t *systems, size_t syste
     }
     for (size_t i = 0; i < system_count; i++) {
         felica_dump_system_free(&systems[i]);
+    }
+}
+
+// Hand the public service blocks to the transit parsers, blocks laid out by number
+static void felica_dump_run_transit_parsers(const felica_dump_system_t *systems, size_t system_count) {
+    transit_felica_system_t tsys[FELICA_DISCOVERED_SYSTEM_MAX_COUNT];
+    memset(tsys, 0, sizeof(tsys));
+    size_t tcount = 0;
+
+    for (size_t i = 0; i < system_count && tcount < ARRAYLEN(tsys); i++) {
+        const felica_dump_system_t *sys = &systems[i];
+        transit_felica_service_t *svc = calloc(sys->node_count + 1, sizeof(transit_felica_service_t));
+        if (svc == NULL) {
+            break;
+        }
+        size_t n = 0;
+        for (size_t j = 0; j < sys->node_count; j++) {
+            const felica_dump_node_t *node = &sys->nodes[j];
+            if (node->type != FELICA_NODE_TYPE_SERVICE) {
+                continue;
+            }
+            // locked services stay listed without blocks, some parsers name the issuer by them
+            svc[n].code = node->node_code_le;
+            uint32_t blocks = 0;
+            for (size_t k = 0; k < node->block_count; k++) {
+                if (node->blocks[k].block_number >= blocks) {
+                    blocks = (uint32_t)node->blocks[k].block_number + 1;
+                }
+            }
+            uint8_t *buf = (blocks > 0) ? calloc(blocks, FELICA_BLK_SIZE) : NULL;
+            if (buf != NULL) {
+                for (size_t k = 0; k < node->block_count; k++) {
+                    memcpy(buf + ((size_t)node->blocks[k].block_number * FELICA_BLK_SIZE), node->blocks[k].data, FELICA_BLK_SIZE);
+                }
+                svc[n].block_count = (uint16_t)blocks;
+                svc[n].blocks = buf;
+            }
+            n++;
+        }
+        tsys[tcount].system_code = sys->system_code;
+        memcpy(tsys[tcount].idm, sys->idm, sizeof(tsys[tcount].idm));
+        tsys[tcount].service_count = n;
+        tsys[tcount].services = svc;
+        tcount++;
+    }
+
+    transit_felica_card_t card = { .system_count = tcount, .systems = tsys };
+    (void)transit_felica_parse(&card);
+
+    for (size_t i = 0; i < tcount; i++) {
+        for (size_t j = 0; j < tsys[i].service_count; j++) {
+            free((void *)tsys[i].services[j].blocks);
+        }
+        free((void *)tsys[i].services);
     }
 }
 
@@ -7110,7 +7263,8 @@ static int CmdHFFelicaDump(const char *Cmd) {
                   "hf felica dump\n"
                   "hf felica dump --retry 5\n"
                   "hf felica dump --idm 11100910C11BC407\n"
-                  "hf felica dump -f my-felica-dump");
+                  "hf felica dump -f my-felica-dump\n"
+                  "hf felica dump --selftest");
     void *argtable[] = {
         arg_param_begin,
         arg_lit0(NULL, "no-auth", "read public services"),
@@ -7118,6 +7272,7 @@ static int CmdHFFelicaDump(const char *Cmd) {
         arg_str0(NULL, "idm", "<hex>", "use custom IDm"),
         arg_str0("f", "file", "<fn>", "Specify a filename for JSON dump file"),
         arg_lit0(NULL, "no-ic-optimizations", "attempt all commands even if the IC is known not to support them"),
+        arg_lit0(NULL, "selftest", "Run the transit parsers self tests and exit"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -7129,9 +7284,20 @@ static int CmdHFFelicaDump(const char *Cmd) {
     int fnlen = 0;
     CLIParamStrToBuf(arg_get_str(ctx, 4), (uint8_t *)filename, FILE_PATH_SIZE, &fnlen);
     bool no_ic_optimizations = arg_get_lit(ctx, 5);
+    bool selftest = arg_get_lit(ctx, 6);
     CLIParserFree(ctx);
     if (res) {
         return PM3_EINVARG;
+    }
+
+    if (selftest) {
+        return transit_felica_selftest();
+    }
+
+    // listed as always available so the self test runs offline
+    if (IfPm3Felica() == false) {
+        PrintAndLogEx(WARNING, "Only offline mode is available, use `" _YELLOW_("--selftest") "`");
+        return PM3_ENOTTY;
     }
 
     // bool no_auth = arg_get_lit(ctx, 1);
@@ -7157,7 +7323,8 @@ static int CmdHFFelicaDump(const char *Cmd) {
     if (res != PM3_SUCCESS || discovered_systems.count == 0) {
         DropField();
         PrintAndLogEx(FAILED, "Unable to discover FeliCa systems.");
-        return res;
+        // discovery can succeed and still find nothing, res is PM3_SUCCESS then
+        return (res != PM3_SUCCESS) ? res : PM3_ESOFT;
     }
 
     PrintAndLogEx(INFO, "Discovered " _GREEN_("%u") " system(s).", (unsigned int)discovered_systems.count);
@@ -7210,6 +7377,8 @@ static int CmdHFFelicaDump(const char *Cmd) {
     if (fnlen == 0) {
         snprintf(filename, sizeof(filename), "hf-felica-%s-dump", sprint_hex_inrow(idm, sizeof(idm)));
     }
+
+    felica_dump_run_transit_parsers(dump_systems, dump_system_count);
 
     json_t *root = felica_dump_systems_json(dump_systems, dump_system_count, &dump_metadata);
     if (root == NULL) {
@@ -7357,7 +7526,7 @@ static int CmdHFFelicaDiscoverNodes(const char *Cmd) {
     uint32_t retry_count = arg_get_u32_def(ctx, 1, FELICA_DISCOVER_DEFAULT_RETRY_COUNT);
     char method_str[64] = {0};
     int method_len = 0;
-    int method_str_status = CLIParamStrToBuf(arg_get_str(ctx, 2), (uint8_t *)method_str, sizeof(method_str) - 1, &method_len);
+    int method_str_status = CLIParamStrToBuf(arg_get_str(ctx, 2), (uint8_t *)method_str, sizeof(method_str), &method_len);
     uint8_t idm[8] = {0};
     int ilen = 0;
     int res = CLIParamHexToBuf(arg_get_str(ctx, 3), idm, sizeof(idm), &ilen);
@@ -8369,7 +8538,7 @@ static int CmdHFFelicaSim(const char *Cmd) {
         arg_param_begin,
         arg_str1("f", "file", "<fn>", "JSON dump file"),
         arg_str0(NULL, "read-without-encryption-error-location-indication",
-        "<mask|index|flag>", "Read Without Encryption error location indication (default: mask)"),
+                 "<mask|index|flag>", "Read Without Encryption error location indication (default: mask)"),
         arg_lit0("v", "verbose", "verbose output"),
         arg_param_end
     };
@@ -9478,7 +9647,7 @@ static command_t CommandTable[] = {
     {"-----------",     CmdHelp,                          AlwaysAvailable, "----------------------- " _CYAN_("FeliCa SEAC") " -----------------------"},
     {"seacauth1",       CmdHFFelicaSeacAuth1,             IfPm3Felica,     "FeliCa SEAC Authentication1"},
     {"-----------",     CmdHelp,                          AlwaysAvailable, "----------------------- " _CYAN_("FeliCa Standard") " -----------------------"},
-    {"dump",            CmdHFFelicaDump,                  IfPm3Felica,     "Wait for and try dumping FeliCa"},
+    {"dump",            CmdHFFelicaDump,                  AlwaysAvailable, "Wait for and try dumping FeliCa"},
     {"discnodes",       CmdHFFelicaDiscoverNodes,         IfPm3Felica,     "discover Area Code and Service Code nodes."},
     {"sim",             CmdHFFelicaSim,                   IfPm3Felica,     "Emulate FeliCa Standard from dump file"},
     {"rqservice",       CmdHFFelicaRequestService,        IfPm3Felica,     "verify the existence of Area and Service, and to acquire Key Version."},

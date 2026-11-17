@@ -50,6 +50,7 @@ int HfReadADC(uint32_t samplesCount, bool ledcontrol) {
 
     uint32_t sbs = samplesCount;
     initSampleBuffer(&sbs);
+    samplesCount = sbs;
 
     uint32_t wdtcntr = 0;
     for (;;) {
@@ -209,6 +210,12 @@ int HfSimulateTkm(const uint8_t *uid, uint8_t modulation, uint32_t timeout) {
     LEDsoff();
 
     uint8_t *data = BigBuf_calloc(256);
+    if (data == NULL) {
+        DbpString("Failed to allocate memory");
+        reply_ng(CMD_HF_TEXKOM_SIMULATE, PM3_EMALLOC, NULL, 0);
+        return PM3_EMALLOC;
+    }
+
     uint32_t elen = HfEncodeTkm(uid, modulation, data);
     if (elen == 0) {
         DbpString("encode error");

@@ -49,14 +49,30 @@ These run over any active connection — USB, BLE, or WiFi.
 [usb] pm3 --> hw status
 ```
 
-The **Battery / BWM** section reports the **AW32001** charger (power path, fault,
-charge state, input limit, charge current/voltage/enable) and the **BQ27427** fuel
-gauge (state-of-charge %, voltage, current, remaining/full capacity, temperature,
-health).
+```
+[#] Battery
+[#]   Charge.............. 83 %  4.07 V  34.7 C  charge done
+[#]   Capacity............ 392 / 473 mAh, health 94 %
+[#] BWM
+[#]   Firmware............ V5 on ESP32-C2, link 1.5 Mbps, BLE off
+[#] Power
+[#]   Power save.......... on, auto-off on USB unplug
+[#]   Flipper............. not attached
+```
+
+The **Battery** section shows the **BQ27427** fuel gauge (state of charge, voltage,
+temperature, charge state, remaining/full capacity, health) and, while discharging,
+the draw and estimated runtime. An **AW32001** charger fault is shown only when present.
+`hw dbg -3` adds the raw gauge values, the charger status and its charge profile
+(input limit, charge current/voltage), the BWM chip and memory details, and the
+power-save counters.
 
 ### `hw bwm setcap` — set fuel-gauge design capacity
 
-Program the BQ27427 **Design Capacity** for the fitted cell.
+Program the BQ27427 **Design Capacity** for the fitted cell, select its 4.2 V
+chemistry profile (chem ID 1202, the gauge ships on the 4.35 V one) and set the
+gauge Terminate Voltage (0 %) to 3300 mV, the firmware low-battery shutdown floor.
+The firmware re-applies these at boot after a gauge reset, keeping a capacity set here.
 
 | Argument      | Description                            |
 | ------------- | -------------------------------------- |
@@ -81,8 +97,8 @@ Clears/sets the AW32001E charge-enable bit (`CEB`, `REG01[3]`).
 | `off`      | Disable charging  |
 
 ```
-hw bwm charge on     # enable charging
-hw bwm charge off    # disable charging
+hw bwm charge --on     # enable charging
+hw bwm charge --off    # disable charging
 ```
 
 > [!NOTE]
@@ -96,19 +112,19 @@ Lowering it below 4.2 V reduces top-of-charge stress and extends cell life.
 
 | Argument    | Description                                                  |
 | ----------- | ----------------------------------------------------------- |
-| `--mv <mV>` | Charge voltage in mV (default `4100`, clamped `3600`..`4200`) |
+| `--mv <mV>` | Charge voltage in mV (default `4200`, clamped `3600`..`4200`) |
 
 ```
-hw bwm vchg            # set the default 4100 mV target (-> 4.095 V)
-hw bwm vchg --mv 4200  # set 4200 mV
+hw bwm vchg            # set the default 4200 mV target
+hw bwm vchg --mv 4100  # set 4100 mV (-> 4.095 V)
 ```
 
 The value snaps to the nearest 15 mV hardware step, and the command reports the
 voltage actually applied (e.g. `4100` → `4.095 V`; `4110` would be the next step).
 
 > [!NOTE]
-> The firmware applies the `4100` mV default (4.095 V) at **every boot** — the
-> AW32001E's own power-on default is 4.2 V. It is a runtime register write, but
+> The firmware applies the `4200` mV default at **every boot**, the full charge of
+> the fitted 3.7 V / 4.2 V cell. It is a runtime register write, but
 > because the boot config disables the charger watchdog the value then holds until
 > the next power cycle (which re-applies it), so you don't need to re-run it per
 > charge.
@@ -125,8 +141,8 @@ drain the battery. Button power-on is unaffected.
 | `off`      | Disable auto power-off  |
 
 ```
-hw bwm autooff off   # disable auto power-off
-hw bwm autooff on    # re-enable auto power-off
+hw bwm autooff --off   # disable auto power-off
+hw bwm autooff --on    # re-enable auto power-off
 ```
 
 > [!NOTE]
@@ -158,6 +174,31 @@ There are three ways to connect: a **native transport** (Linux), a **cross-platf
 Python bridge** (Linux / macOS / Windows / WSL / iOS), and a **bridge app** on Android
 ([2.4](#24-android--termux--ble-bridge-app)).
 
+### `hw bwm name` — get/set the BLE advertising name
+
+Reads or changes the name the BWM advertises over BLE. With no argument it prints
+the current name; `--set` changes it (1–31 characters).
+
+| Argument        | Description                                          |
+| --------------- | ---------------------------------------------------- |
+| `--set <name>`  | New BLE name, 1–31 chars; omit to read current name  |
+
+```
+hw bwm name                # show the current BLE name
+hw bwm name --set MyPM5    # set the BLE name to 'MyPM5'
+```
+
+The name is stored on the BWM in NVS, so it persists across power cycles. The BWM
+applies the advertised name at BLE start-up, so setting a name reboots the BWM to
+make it take effect — this briefly drops a BLE or WiFi connection, so reconnect
+after a few seconds. Over USB the reboot is not noticeable, since the client stays
+connected to the PM5 while only the BWM's ESP restarts.
+
+> [!NOTE]
+> If a device is connected over BLE when you change the name, the running
+> advertisement can't change mid-connection; the new name shows up on the next
+> scan after the reboot.
+
 ### 2.1 Native BLE transport — Linux only, no bridge
 
 Uses a raw L2CAP/ATT socket — no `bleak`, no `bluetoothd` daemon dependency.
@@ -178,8 +219,9 @@ On success you'll see e.g. `BLE connected, MTU 512, char handle 0x0014`.
 
 ### 2.2 BLE bridge — cross-platform (`pm5_ble_bridge.py`)
 
-Requires Python 3 and `bleak` (`pip install bleak`). It bridges the BWM's BLE SPP
-to a PTY or a TCP socket that the pm3 client then opens.
+Requires Python 3 and `bleak` (`python3 -m pip install -r client/requirements.txt`,
+or just `pip install bleak`). It bridges the BWM's BLE SPP to a PTY or a TCP
+socket that the pm3 client then opens.
 
 > [!IMPORTANT]
 > Run the bridge on the machine that has the **Bluetooth radio**.
@@ -203,8 +245,8 @@ python3 pm5_ble_bridge.py --pty        # default link /tmp/pm5-ble
 **b) TCP listener** — bridge listens, client connects in:
 
 ```
-python3 pm5_ble_bridge.py --tcp 7777   # or HOST:PORT
-./pm3 -p tcp:127.0.0.1:7777
+python3 pm5_ble_bridge.py --tcp 18888   # or HOST:PORT
+./pm3 -p tcp:127.0.0.1:18888
 ```
 
 **c) Outbound TCP** (`--connect`) — bridge dials **out** to a listener. Pairs with
@@ -212,13 +254,13 @@ the client's `--wait` mode ([2.3](#23-client-listen-mode--pm3----wait)) and cros
 the WSL2 NAT boundary:
 
 ```
-python3 pm5_ble_bridge.py --connect 127.0.0.1:7777
+python3 pm5_ble_bridge.py --connect 127.0.0.1:18888
 ```
 
 **d) Relay only** (no BLE) — TCP listener ↔ PTY, for chaining:
 
 ```
-python3 pm5_ble_bridge.py --relay --listen 7777 --pty
+python3 pm5_ble_bridge.py --relay --listen 18888 --pty
 ```
 
 > [!NOTE]
@@ -233,10 +275,10 @@ bridge at it with `--connect`. This removes the relay/PTY hop.
 
 ```
 # window 1 — client listens (blocks until something connects)
-./pm3 -p tcp:127.0.0.1:7777 --wait
+./pm3 -p tcp:127.0.0.1:18888 --wait
 
 # window 2 — bridge dials in (on the machine with the radio)
-python3 pm5_ble_bridge.py --connect 127.0.0.1:7777
+python3 pm5_ble_bridge.py --connect 127.0.0.1:18888
 ```
 
 > [!NOTE]
@@ -258,14 +300,18 @@ limited to 10 minutes per session (the limit resets after quitting the app).
 
 | Setting          | Value                                                             |
 | ---------------- | ----------------------------------------------------------------- |
-| Device A         | Start TCP server (default port `54321`)                           |
+| Device A         | Start TCP server, use client default port:`18888`                 |
 | Device B         | Connect to BLE device → `Proxmark5`                               |
 | Characteristic   | the last one: service `0000ae86-…`, characteristic `0000ae88-…`, for RX+TX |
 
-3. In Termux, connect over the local port:
+1. In Termux, connect over the local port:
 
 ```
-./client/proxmark3 tcp:localhost:54321
+./client/proxmark3 tcp:localhost:18888
+```
+Or, as we're using the default port, just
+```
+./client/proxmark3 tcp:localhost
 ```
 
 No pairing is needed (the BWM has no BLE security). The same app also does classic
@@ -282,7 +328,7 @@ Bluetooth, so one setup covers a Blueshark-equipped Proxmark3 too.
 
 `hw bwm wifi` joins your WiFi network as a **station** and starts a **TCP server** on
 the BWM. You then connect the client over plain TCP. Run `hw bwm wifi` over an
-existing link (USB, or an existing BLE connection). Use `hw bwm wifi status` to check an
+existing link (USB, or an existing BLE connection). Use `hw bwm wifi --status` to check an
 existing connection without touching the config.
 
 ### 3.1 Bring up WiFi
@@ -295,11 +341,11 @@ hw bwm wifi --ssid <ssid> [--pwd <password>] [--port <n>] [--hostname <name>]
 | ------------------- | ---------------------------------------- |
 | `--ssid <ssid>`     | WiFi network to join **(required)**      |
 | `--pwd <password>`  | WiFi password (omit for an open network) |
-| `--port <dec>`      | TCP server listen port (default `7777`)  |
+| `--port <dec>`      | TCP server listen port (default `18888`) |
 | `--hostname <name>` | DHCP hostname (default `Proxmark5`)      |
 
-Two sub-actions take no other arguments and are positional (no dashes):
-`hw bwm wifi status` and `hw bwm wifi stop` (see 3.3 and 3.4).
+Two sub-actions take no other arguments:
+`hw bwm wifi --status` and `hw bwm wifi --stop` (see 3.3 and 3.4).
 
 ```
 hw bwm wifi --ssid Home --pwd secret
@@ -312,23 +358,28 @@ strings:
 
 ```
 [+] BWM on WiFi at 192.168.1.77
-[?] Connect with: pm3 -p tcp:192.168.1.77:7777
-[?] Or by name (router-dependent): pm3 -p tcp:pm5-lab:7777
+[?] Connect with: pm3 -p tcp:192.168.1.77:18888
+[?] Or by name (router-dependent): pm3 -p tcp:pm5-lab:18888
 ```
 
 ### 3.2 Connect over WiFi
 
 ```
-./pm3 -p tcp:192.168.1.77:7777
+./pm3 -p tcp:192.168.1.77:18888
+```
+Or, as we're using the default port, just
+```
+./pm3 -p tcp:192.168.1.77
 ```
 
 > [!NOTE]
 > Connecting **by hostname** works only if your router registers DHCP client names
 > in its local DNS (some need a suffix like `<name>.lan` or `<name>.home`; some
-> don't do it at all). There is **no mDNS / `.local`** responder, so the IP is the
-> reliable path.
+> don't do it at all). BWM firmware with mDNS also answers `<name>.local`, e.g.
+> `./pm3 -p tcp:pm5-lab.local:18888`; this needs an mDNS-capable resolver on the host
+> (Avahi/nss-mdns or systemd-resolved on Linux; built in on macOS and Windows 10+).
 
-### 3.3 Check WiFi status — `hw bwm wifi status`
+### 3.3 Check WiFi status — `hw bwm wifi --status`
 
 Queries the BWM's current connection state and IP **without** reconnecting or
 changing the WiFi config. Handy to confirm a join actually completed — the
@@ -336,7 +387,7 @@ bring-up occasionally reports failure if the DHCP lease lands late, even though
 the STA connected a moment later.
 
 ```
-hw bwm wifi status
+hw bwm wifi --status
 ```
 
 ```
@@ -349,17 +400,17 @@ hw bwm wifi status
 > not connected right after a bring-up, wait a few seconds and re-check — the
 > lease may still be in flight.
 
-### 3.4 Stop WiFi — `hw bwm wifi stop`
+### 3.4 Stop WiFi — `hw bwm wifi --stop`
 
 Tears down the WiFi station and TCP server and returns the BWM to **BLE-only**.
 Run it over an existing link (USB or BLE); it does not need any other arguments.
 
 ```
-hw bwm wifi stop
+hw bwm wifi --stop
 ```
 
 > [!NOTE]
-> If you issue `hw bwm wifi stop` over the **WiFi** connection itself, that connection
+> If you issue `hw bwm wifi --stop` over the **WiFi** connection itself, that connection
 > drops as the TCP server goes away — reconnect over USB or BLE afterwards.
 
 ---

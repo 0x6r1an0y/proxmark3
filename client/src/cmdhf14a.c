@@ -15,6 +15,9 @@
 //-----------------------------------------------------------------------------
 // High frequency ISO14443A commands
 //-----------------------------------------------------------------------------
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200112L
+#endif
 #include "cmdhf14a.h"
 #include <ctype.h>
 #include <string.h>
@@ -48,6 +51,7 @@
 #include "mbedtls/cmac.h"
 #include "jansson.h"             // JSON parsing
 #include "pla.h"                 // ECP parsing
+#include "parsers/parsetransit.h"  // transit card identification
 
 static bool g_apdu_in_framing_enable = true;
 bool Get_apdu_in_framing(void) {
@@ -58,7 +62,7 @@ void Set_apdu_in_framing(bool v) {
 }
 
 static int CmdHelp(const char *Cmd);
-static int waitCmd(bool i_select, uint32_t timeout, bool verbose);
+static int waitCmd(bool i_select, uint32_t timeout, bool verbose, CrcType_t crc_type);
 
 
 // based on ISO/IEC JTC1/SC17 STANDING DOCUMENT 5 (Updated 20 September 2024) Register of IC manufacturers
@@ -235,7 +239,7 @@ const char *getTagInfo(uint8_t uid) {
 static const hintAIDList_t hintAIDList[] = {
     { "\xA0\x00\x00\x06\x47\x2F\x00\x01", 8, "", 0, "FIDO", "hf fido" },
     { "\xA0\x00\x00\x03\x08\x00\x00\x10\x00\x01\x00", 11, "", 0, "PIV", "" },
-    { "\xD2\x76\x00\x01\x24\x01", 8, "", 0, "OpenPGP", "" },
+    { "\xD2\x76\x00\x01\x24\x01", 6, "", 0, "OpenPGP", "" },
     { "\x31\x50\x41\x59\x2E\x53\x59\x53\x2E\x44\x44\x46\x30\x31", 14, "", 0, "EMV (pse)", "emv" },
     { "\x32\x50\x41\x59\x2E\x53\x59\x53\x2E\x44\x44\x46\x30\x31", 14, "", 0, "EMV (ppse)", "emv" },
     { "\x41\x44\x20\x46\x31", 5, "", 0, "CIPURSE", "hf cipurse" },
@@ -244,6 +248,7 @@ static const hintAIDList_t hintAIDList[] = {
     { "\x4F\x53\x45\x2E\x56\x41\x53\x2E\x30\x31", 10, "ApplePay", 8, "OSE.VAS (Apple Wallet)", "hf vas" },
     { "\x4F\x53\x45\x2E\x56\x41\x53\x2E\x30\x31", 10, "AndroidPay", 10, "OSE.VAS (Google Wallet)", "hf gst" },
     { "\xA0\x00\x00\x04\x76\xD0\x00\x01\x11", 9, "", 0, "Google Smart Tap v2", "hf gst" },
+    { "\xA0\x00\x00\x04\x40\x00\x01\x01\x00\x01", 10, "", 0, "SEOS", "hf seos" },
 };
 
 // iso14a apdu input frame length
@@ -735,7 +740,7 @@ int Hf14443_4aGetCardData(iso14a_card_select_t *card) {
 
 // Annex C uses CRC-B and continuous frames without parity.
 static int hf14a_timeslot_exchange(const uint8_t *data, uint16_t len, bool request,
-                                  PacketResponseNG *resp, uint16_t *rlen) {
+                                   PacketResponseNG *resp, uint16_t *rlen) {
     uint8_t frame[11];
     if (len > sizeof(frame) - 2) {
         return PM3_EINVARG;
@@ -753,7 +758,7 @@ static int hf14a_timeslot_exchange(const uint8_t *data, uint16_t len, bool reque
     clearCommandBuffer();
     // Timeouts in 128/fc units; inter-frame delay in microseconds.
     SendIso14aReaderEx(flags, frame, len, len, request ? 7 : 0,
-                      request ? 79 : 547, request ? 0 : 1100);
+                       request ? 79 : 547, request ? 0 : 1100);
     if (WaitForIso14aReply(resp, 1500, rlen, NULL) == false || *rlen == 0) {
         return PM3_ETIMEOUT;
     }
@@ -1310,6 +1315,9 @@ int CmdHF14ASniff(const char *Cmd) {
     return PM3_SUCCESS;
 }
 
+// ISO/IEC 14443-4 7.5.6 leaves the retransmission count to the PCD
+#define ISO14A_MAX_RETRANS 2
+
 int ExchangeRAW14a(uint8_t *datain, int datainlen, bool activateField, bool leaveSignalON, uint8_t *dataout, int maxdataoutlen, int *dataoutlen, bool silentMode) {
 
     uint16_t cmdc = 0;
@@ -1328,11 +1336,19 @@ int ExchangeRAW14a(uint8_t *datain, int datainlen, bool activateField, bool leav
         cmdc |= ISO14A_NO_DISCONNECT;
     }
 
+    // ISO/IEC 14443-4 7.5.3: the block number toggles once the PICC has answered
+    // the block, not when it is built.  Toggling here left it out of step with the
+    // card for every exchange that did not complete, and nothing but a reselect
+    // put it back
     uint8_t data[PM3_CMD_DATA_SIZE] = { 0x0a | gs_frames_num, 0x00 };
-    gs_frames_num ^= 1;
 
     int min = MIN((int)(g_conn.max_cmd_data_size - 2), (datainlen & 0x1FF));
     memcpy(&data[2], datain, min);
+
+    // R(NAK) for this block, same CID as the I-block above
+    uint8_t nak[2] = { (uint8_t)(0xBA | gs_frames_num), 0x00 };
+    uint8_t attempt = 0;
+
     SendIso14aReader(ISO14A_RAW | ISO14A_APPEND_CRC | cmdc, data, min + 2);
 
     uint8_t *recv;
@@ -1344,10 +1360,25 @@ resend:
         int iLen = rlen_1245;
 
         if (iLen == 0) {
+            // ISO/IEC 14443-4 7.5.6: a lost answer is a transmission error, not a
+            // dead exchange.  R(NAK) asks the PICC for its last block again
+            if (attempt++ < ISO14A_MAX_RETRANS) {
+                SendIso14aReader(ISO14A_RAW | ISO14A_APPEND_CRC | ISO14A_NO_DISCONNECT | cmdc, nak, sizeof(nak));
+                goto resend;
+            }
             if (silentMode == false) {
                 PrintAndLogEx(ERR, "No card response");
             }
             return PM3_ECARDEXCHANGE;
+        }
+
+        // R(ACK) carrying the other block number: the PICC never got our block,
+        // so it goes out once more
+        if ((recv[0] & 0xF6) == 0xA2 && (recv[0] & 0x01) != (data[0] & 0x01)) {
+            if (attempt++ < ISO14A_MAX_RETRANS) {
+                SendIso14aReader(ISO14A_RAW | ISO14A_APPEND_CRC | cmdc, data, min + 2);
+                goto resend;
+            }
         }
 
         *dataoutlen = iLen - 2;
@@ -1386,6 +1417,9 @@ resend:
             return PM3_ELENGTH;
         }
 
+        // the PICC answered this block, so the exchange is complete
+        gs_frames_num ^= 1;
+
         memcpy(dataout, &recv[2], *dataoutlen);
 
         // CRC Check
@@ -1397,6 +1431,8 @@ resend:
         }
 
     } else {
+        // the device itself went quiet, not the card.  Asking again would only
+        // stack up another full wait
         if (silentMode == false) {
             PrintAndLogEx(ERR, "Reply timeout.");
         }
@@ -1907,13 +1943,12 @@ static int CmdHF14ACmdRaw(const char *Cmd) {
         }
     }
 
+    // the CRC of the frame format in use, for the command and for its answer
+    CrcType_t crc_type = (topazmode) ? CRC_14443_B : CRC_14443_A;
+
     if (crc && datalen > 0 && datalen < sizeof(data) - 2) {
         uint8_t first, second;
-        if (topazmode) {
-            compute_crc(CRC_14443_B, data, datalen, &first, &second);
-        } else {
-            compute_crc(CRC_14443_A, data, datalen, &first, &second);
-        }
+        compute_crc(crc_type, data, datalen, &first, &second);
         data[datalen++] = first;
         data[datalen++] = second;
     }
@@ -1985,14 +2020,14 @@ static int CmdHF14ACmdRaw(const char *Cmd) {
     if (reply) {
         int res = 0;
         if (active_select)
-            res = waitCmd(true, timeout, verbose);
+            res = waitCmd(true, timeout, verbose, crc_type);
         if (res == PM3_SUCCESS && datalen > 0)
-            waitCmd(false, timeout, verbose);
+            waitCmd(false, timeout, verbose, crc_type);
     }
     return PM3_SUCCESS;
 }
 
-static int waitCmd(bool i_select, uint32_t timeout, bool verbose) {
+static int waitCmd(bool i_select, uint32_t timeout, bool verbose, CrcType_t crc_type) {
     PacketResponseNG resp;
     uint16_t rlen = 0;
 
@@ -2023,7 +2058,7 @@ static int waitCmd(bool i_select, uint32_t timeout, bool verbose) {
         uint8_t *data = resp.data.asBytes;
 
         if (i_select == false && len >= 3) {
-            bool crc = check_crc(CRC_14443_A, data, len);
+            bool crc = check_crc(crc_type, data, len);
 
             char s[16];
             snprintf(s,
@@ -2049,20 +2084,28 @@ static int CmdHF14AAntiFuzz(const char *Cmd) {
 
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf 14a antifuzz",
-                  "Tries to fuzz the ISO14443a anticollision phase",
-                  "hf 14a antifuzz -4\n");
+                  "Tries to fuzz the ISO14443a anticollision phase.\n"
+                  "Default keeps the cascade bit set in every SAK, so the reader asks for\n"
+                  "one more cascade level until its UID buffer gives up.  With --coll only\n"
+                  "the first UID byte goes out clean and every bit after it collides, so the\n"
+                  "reader has to resolve 24 bits one round trip at a time; it is then given a\n"
+                  "BCC that checks out, and the SAK sends it round again one level deeper.",
+                  "hf 14a antifuzz -4\n"
+                  "hf 14a antifuzz --10 --coll\n");
 
     void *argtable[] = {
         arg_param_begin,
-        arg_lit0("4",   NULL,  "4 byte uid"),
-        arg_lit0("7",   NULL,  "7 byte uid"),
-        arg_lit0(NULL,  "10",  "10 byte uid"),
+        arg_lit0("4",   NULL,   "4 byte uid"),
+        arg_lit0("7",   NULL,   "7 byte uid"),
+        arg_lit0(NULL,  "10",   "10 byte uid"),
+        arg_lit0(NULL,  "coll", "collision storm instead of cascade overflow"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
 
     struct {
         uint8_t flag;
+        uint8_t mode;
     } PACKED param;
     param.flag = 0;
     FLAG_SET_UID_IN_DATA(param.flag, 4);
@@ -2072,10 +2115,32 @@ static int CmdHF14AAntiFuzz(const char *Cmd) {
     if (arg_get_lit(ctx, 3)) {
         FLAG_SET_UID_IN_DATA(param.flag, 10);
     }
+    param.mode = arg_get_lit(ctx, 4) ? ANTIFUZZ_MODE_COLLISION : ANTIFUZZ_MODE_CASCADE;
 
     CLIParserFree(ctx);
     clearCommandBuffer();
     SendCommandNG(CMD_HF_ISO14443A_ANTIFUZZ, (uint8_t *)&param, sizeof(param));
+
+    PrintAndLogEx(INFO, "Press " _GREEN_("pm3 button") " or " _GREEN_("<Enter>") " to abort");
+
+    PacketResponseNG resp;
+    bool keypress = kbd_enter_pressed();
+    while (keypress == false) {
+        keypress = kbd_enter_pressed();
+
+        if (WaitForResponseTimeout(CMD_HF_ISO14443A_ANTIFUZZ, &resp, 500)) {
+            break;
+        }
+    }
+
+    if (keypress) {
+        // inform device to break the fuzz loop since the client has exited
+        SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+        WaitForResponse(CMD_HF_ISO14443A_ANTIFUZZ, &resp);
+    }
+
+    PrintAndLogEx(INFO, "Done!");
+    PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf 14a list") "` to view the fuzzed anticollision");
     return PM3_SUCCESS;
 }
 
@@ -2900,6 +2965,113 @@ static void get_compact_tlv(uint8_t *d, uint8_t n) {
     }
 }
 
+// selects every AID in aidlist.json, returns how many were found
+// emv_found (optional) is set when an EMV application answers
+int hf14a_aid_search(bool verbose, bool *emv_found) {
+
+    PrintAndLogEx(INFO, "-------------------- " _CYAN_("AID Search") " --------------------");
+
+    json_t *root = AIDSearchInit(verbose);
+    if (root == NULL) {
+        return 0;
+    }
+
+    int found = 0;
+    bool ActivateField = true;
+    for (size_t elmindx = 0; elmindx < json_array_size(root); elmindx++) {
+
+        if (kbd_enter_pressed()) {
+            break;
+        }
+
+        json_t *data = AIDSearchGetElm(root, elmindx);
+        uint8_t vaid[200] = {0};
+        int vaidlen = 0;
+        if ((AIDGetFromElm(data, vaid, sizeof(vaid), &vaidlen) == false) || (vaidlen == 0)) {
+            continue;
+        }
+        if (AIDSeenBefore(root, vaid, (size_t)vaidlen, elmindx)) {
+            continue;
+        }
+
+        uint16_t sw = 0;
+        uint8_t result[1024] = {0};
+        size_t resultlen = 0;
+        int res = Iso7816Select(CC_CONTACTLESS, ActivateField, true, vaid, vaidlen, result, sizeof(result), &resultlen, &sw);
+        ActivateField = false;
+        if (res) {
+            continue;
+        }
+
+        uint8_t dfname[200] = {0};
+        size_t dfnamelen = 0;
+        if (resultlen > 3) {
+            struct tlvdb *tlv = tlvdb_parse_multi(result, resultlen);
+            if (tlv) {
+                // 0x84 Dedicated File (DF) Name
+                const struct tlv *dfnametlv = tlvdb_get_tlv(tlvdb_find_full(tlv, 0x84));
+                if (dfnametlv) {
+                    dfnamelen = dfnametlv->len;
+                    memcpy(dfname, dfnametlv->value, dfnamelen);
+                }
+                tlvdb_free(tlv);
+            }
+        }
+
+        if (sw == ISO7816_OK || sw == ISO7816_INVALID_DF || sw == ISO7816_FILE_TERMINATED) {
+            if (sw == ISO7816_OK) {
+                if (verbose) PrintAndLogEx(SUCCESS, "Application ( " _GREEN_("ok") " )");
+            } else {
+                if (verbose) PrintAndLogEx(WARNING, "Application ( " _RED_("blocked") " )");
+            }
+
+            uint8_t response_for_match[1026] = {0};
+            size_t response_for_match_len = resultlen;
+            memcpy(response_for_match, result, MIN(resultlen, sizeof(response_for_match)));
+            if ((response_for_match_len + 2) <= sizeof(response_for_match)) {
+                response_for_match[response_for_match_len] = sw >> 8;
+                response_for_match[response_for_match_len + 1] = sw & 0xff;
+                response_for_match_len += 2;
+            }
+            PrintAIDDescriptionEx(root, sprint_hex_inrow(vaid, vaidlen), response_for_match, response_for_match_len, verbose);
+
+            if (dfnamelen) {
+                if (dfnamelen == vaidlen) {
+
+                    if (memcmp(dfname, vaid, vaidlen) == 0) {
+                        if (verbose) PrintAndLogEx(INFO, "(DF) Name found and equal to AID");
+                    } else {
+                        PrintAndLogEx(INFO, "(DF) Name not equal to AID: " _YELLOW_("%s"), sprint_hex_inrow(dfname, dfnamelen));
+                        PrintAIDDescriptionBuf(root, dfname, dfnamelen, verbose);
+                    }
+
+                } else {
+                    PrintAndLogEx(INFO, "(DF) Name not equal to AID: " _YELLOW_("%s"), sprint_hex_inrow(dfname, dfnamelen));
+                    PrintAIDDescriptionBuf(root, dfname, dfnamelen, verbose);
+                }
+
+            } else {
+                if (verbose) PrintAndLogEx(INFO, "(DF) Name not found");
+            }
+
+            if (verbose) PrintAndLogEx(SUCCESS, "----------------------------------------------------");
+            found++;
+
+            const char *type = AIDGetTypeFromElm(data);
+            if (emv_found && type && strcmp(type, "EMV") == 0) {
+                *emv_found = true;
+            }
+        }
+
+    }
+    DropField();
+    if (verbose == false && found) {
+        PrintAndLogEx(INFO, "----------------------------------------------------");
+    }
+    AIDSearchFree(root);
+    return found;
+}
+
 int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
 
     uint8_t dbg_curr = DBG_NONE;
@@ -2964,9 +3136,11 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
             return PM3_ETIMEOUT;
         }
 
-        memcpy(card.ats, resp.data.asBytes, rlen_2863);
-        card.ats_len = rlen_2863; // note: ats_len includes CRC Bytes
-        if (card.ats_len > 3) {
+        // Only a well formed ATS, TL plus the bytes TL counts plus CRC, means the
+        // PICC entered ISO14443-4.  A 4 bit NAK to RATS is not an ATS.
+        if ((rlen_2863 > 3) && (resp.data.asBytes[0] == rlen_2863 - 2)) {
+            memcpy(card.ats, resp.data.asBytes, rlen_2863);
+            card.ats_len = rlen_2863; // note: ats_len includes CRC Bytes
             select_status = 4;
         }
     }
@@ -3003,6 +3177,8 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
     bool isISO18092 = false;
     bool isNTAG424 = false;
     bool isSEOS = false;
+    bool isWaveshare = false;
+    bool isGoodisplay = false;
     int nxptype = MTNONE;
 
     if (card.uidlen <= 4) {
@@ -3094,8 +3270,9 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
                 break;
             }
             case 0x46: {
-                if (memcmp(card.uid, "FSTN10m", 7) == 0) {
+                if ((memcmp(card.uid, "FSTN10m", 7) == 0) || (memcmp(card.uid, "FSTN11m", 7) == 0)) {
                     isMifareClassic = false;
+                    isWaveshare = true;
                     printTag("Waveshare NFC-Powered e-Paper 1.54\" (please disregard MANUFACTURER mapping above)");
                 }
                 break;
@@ -3103,6 +3280,7 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
             case 0x57: {
                 if (memcmp(card.uid, "WSDZ10m", 7) == 0) {
                     isMifareClassic = false;
+                    isWaveshare = true;
                     printTag("Waveshare NFC-Powered e-Paper (please disregard MANUFACTURER mapping above)");
                 }
                 break;
@@ -3210,6 +3388,13 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
             isMifareDESFire = false;
         }
 
+        // Goodisplay NFC e-paper (FM1280), historical bytes 90 <UID> 00
+        if ((card.sak == 0x28) && (card.uidlen == 4) && (card.ats_len == 13) &&
+                (memcmp(card.ats, "\x0B\x78\x33\xA0\x02\x90", 6) == 0) &&
+                (memcmp(card.ats + 6, card.uid, 4) == 0) && (card.ats[10] == 0x00)) {
+            isGoodisplay = true;
+        }
+
         PrintAndLogEx(SUCCESS, "ATS: " _YELLOW_("%s")"[ %02X %02X ]", sprint_hex(card.ats, card.ats_len - 2), card.ats[card.ats_len - 2], card.ats[card.ats_len - 1]);
         PrintAndLogEx(INFO, "     " _YELLOW_("%02X") "...............  TL    length is " _GREEN_("%d") " bytes", card.ats[0], card.ats[0]);
 
@@ -3222,7 +3407,7 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
                 int16_t fsci = card.ats[1] & 0x0f;
 
                 PrintAndLogEx(INFO, "     ..." _YELLOW_("%02X") "............  T0    TA1 is%s present, TB1 is%s present, "
-                                    "TC1 is%s present, FSCI is %d (FSC = %d)",
+                              "TC1 is%s present, FSCI is %d (FSC = %d)",
                               card.ats[1],
                               (ta1 ? "" : _RED_(" NOT")),
                               (tb1 ? "" : _RED_(" NOT")),
@@ -3244,7 +3429,7 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
                 if (strlen(ds) != 0) ds[strlen(ds) - 2] = '\0';
                 if (strlen(dr) != 0) dr[strlen(dr) - 2] = '\0';
                 PrintAndLogEx(INFO, "     ......" _YELLOW_("%02X") ".........  TA1   different divisors are%s supported, "
-                                    "DR: [%s], DS: [%s]",
+                              "DR: [%s], DS: [%s]",
                               card.ats[pos],
                               ((card.ats[pos] & 0x80) ? _RED_(" NOT") : ""),
                               dr,
@@ -3367,10 +3552,11 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
                         int atrLen = 0;
                         atsToEmulatedAtr(card.ats, atr, &atrLen);
                         char *copy = str_dup(getAtrInfo(sprint_hex_inrow(atr, atrLen)));
-                        char *token = strtok(copy, "\n");
+                        char *saveptr = NULL;
+                        char *token = strtok_r(copy, "\n", &saveptr);
                         while (token != NULL) {
                             PrintAndLogEx(SUCCESS, "    %s", token);
-                            token = strtok(NULL, "\n");
+                            token = strtok_r(NULL, "\n", &saveptr);
                         }
                         free(copy);
                     }
@@ -3379,99 +3565,10 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
         }
 
         if (do_aid_search) {
-
-            PrintAndLogEx(INFO, "-------------------- " _CYAN_("AID Search") " --------------------");
-
-            json_t *root = AIDSearchInit(verbose);
-            if (root != NULL) {
-                bool found = false;
-                bool ActivateField = true;
-                for (size_t elmindx = 0; elmindx < json_array_size(root); elmindx++) {
-
-                    if (kbd_enter_pressed()) {
-                        break;
-                    }
-
-                    json_t *data = AIDSearchGetElm(root, elmindx);
-                    uint8_t vaid[200] = {0};
-                    int vaidlen = 0;
-                    if ((AIDGetFromElm(data, vaid, sizeof(vaid), &vaidlen) == false) || (vaidlen == 0)) {
-                        continue;
-                    }
-                    if (AIDSeenBefore(root, vaid, (size_t)vaidlen, elmindx)) {
-                        continue;
-                    }
-
-                    uint16_t sw = 0;
-                    uint8_t result[1024] = {0};
-                    size_t resultlen = 0;
-                    res = Iso7816Select(CC_CONTACTLESS, ActivateField, true, vaid, vaidlen, result, sizeof(result), &resultlen, &sw);
-                    ActivateField = false;
-                    if (res) {
-                        continue;
-                    }
-
-                    uint8_t dfname[200] = {0};
-                    size_t dfnamelen = 0;
-                    if (resultlen > 3) {
-                        struct tlvdb *tlv = tlvdb_parse_multi(result, resultlen);
-                        if (tlv) {
-                            // 0x84 Dedicated File (DF) Name
-                            const struct tlv *dfnametlv = tlvdb_get_tlv(tlvdb_find_full(tlv, 0x84));
-                            if (dfnametlv) {
-                                dfnamelen = dfnametlv->len;
-                                memcpy(dfname, dfnametlv->value, dfnamelen);
-                            }
-                            tlvdb_free(tlv);
-                        }
-                    }
-
-                    if (sw == ISO7816_OK || sw == ISO7816_INVALID_DF || sw == ISO7816_FILE_TERMINATED) {
-                        if (sw == ISO7816_OK) {
-                            if (verbose) PrintAndLogEx(SUCCESS, "Application ( " _GREEN_("ok") " )");
-                        } else {
-                            if (verbose) PrintAndLogEx(WARNING, "Application ( " _RED_("blocked") " )");
-                        }
-
-                        uint8_t response_for_match[1026] = {0};
-                        size_t response_for_match_len = resultlen;
-                        memcpy(response_for_match, result, MIN(resultlen, sizeof(response_for_match)));
-                        if ((response_for_match_len + 2) <= sizeof(response_for_match)) {
-                            response_for_match[response_for_match_len] = sw >> 8;
-                            response_for_match[response_for_match_len + 1] = sw & 0xff;
-                            response_for_match_len += 2;
-                        }
-                        PrintAIDDescriptionEx(root, sprint_hex_inrow(vaid, vaidlen), response_for_match, response_for_match_len, verbose);
-
-                        if (dfnamelen) {
-                            if (dfnamelen == vaidlen) {
-
-                                if (memcmp(dfname, vaid, vaidlen) == 0) {
-                                    if (verbose) PrintAndLogEx(INFO, "(DF) Name found and equal to AID");
-                                } else {
-                                    PrintAndLogEx(INFO, "(DF) Name not equal to AID: " _YELLOW_("%s"), sprint_hex_inrow(dfname, dfnamelen));
-                                    PrintAIDDescriptionBuf(root, dfname, dfnamelen, verbose);
-                                }
-
-                            } else {
-                                PrintAndLogEx(INFO, "(DF) Name not equal to AID: " _YELLOW_("%s"), sprint_hex_inrow(dfname, dfnamelen));
-                                PrintAIDDescriptionBuf(root, dfname, dfnamelen, verbose);
-                            }
-
-                        } else {
-                            if (verbose) PrintAndLogEx(INFO, "(DF) Name not found");
-                        }
-
-                        if (verbose) PrintAndLogEx(SUCCESS, "----------------------------------------------------");
-                        found = true;
-                        isEMV = true;
-                    }
-
-                }
-                DropField();
-                if (verbose == false && found) {
-                    PrintAndLogEx(INFO, "----------------------------------------------------");
-                }
+            bool emv_found = false;
+            hf14a_aid_search(verbose, &emv_found);
+            if (emv_found) {
+                isEMV = true;
             }
         }
 
@@ -3561,8 +3658,17 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
         PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mfp info") "`");
     }
 
-    if (isMifareDESFire && (isMagic == MAGIC_FLAG_NONE) && isEMV == false) {
+    bool mfdes_hint = (isMifareDESFire && (isMagic == MAGIC_FLAG_NONE) && isEMV == false);
+    if (mfdes_hint) {
         PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mfdes info") "`");
+    }
+
+    // transit cards known by their ATS alone, no card exchange
+    transit_mfdes_info_t transit_info = { .aids_known = false, .card = &card };
+    transit_idents_t transit_ids;
+    if (card.ats_len > 0 && transit_mfdes_identify(&transit_info, &transit_ids) > 0) {
+        transit_print_idents(&transit_ids);
+        transit_print_ident_hints(&transit_ids, mfdes_hint ? "hf mfdes info" : NULL);
     }
 
     if (isST) {
@@ -3583,22 +3689,25 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
 
     if (isFUDAN) {
         PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf fudan dump") "`");
-        /*
-        PrintAndLogEx(HINT, "  hf 14a raw -a -b 7 -k 26");
-        PrintAndLogEx(HINT, "  hf 14a raw -k -c 3000");
-        PrintAndLogEx(HINT, "  hf 14a raw -k -c 3001");
-        PrintAndLogEx(HINT, "  hf 14a raw -k -c 3002");
-        PrintAndLogEx(HINT, "  hf 14a raw -k -c 3003");
-        PrintAndLogEx(HINT, "  hf 14a raw -k -c 3004");
-        PrintAndLogEx(HINT, "  hf 14a raw -k -c 3005");
-        PrintAndLogEx(HINT, "  hf 14a raw -k -c 3006");
-        PrintAndLogEx(HINT, "  hf 14a raw -c 3007");
-        */
     }
 
     if (isNTAG424) {
         PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf ntag424 info") "`");
     }
+
+#ifdef HAVE_GD
+    if (isWaveshare) {
+        PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf waveshare load -h") "`");
+    }
+
+    if (isGoodisplay) {
+        PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf goodisplay load -h") "`");
+    }
+#else
+    // e-paper commands need libgd
+    (void)isWaveshare;
+    (void)isGoodisplay;
+#endif
 
     if (isMifareClassic || isMifareMini) {
         if (((isMagic & MAGIC_FLAG_GEN_1A) == MAGIC_FLAG_GEN_1A) || ((isMagic & MAGIC_FLAG_GEN_1B) == MAGIC_FLAG_GEN_1B)) {

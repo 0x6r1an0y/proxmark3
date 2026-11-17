@@ -38,6 +38,7 @@
 #include "cmdhfsecc.h"      // iClass SE Config Card
 #include "cmdhffudan.h"     // Fudan cards
 #include "cmdhfgallagher.h" // Gallagher DESFire cards
+#include "cmdhfgp.h"        // GlobalPlatform
 #include "cmdhfgst.h"       // Google Smart Tap
 #include "cmdhficlass.h"    // ICLASS
 #include "cmdhfict.h"       // ICT MFC / DESfire cards
@@ -59,6 +60,7 @@
 #include "cmdhftopaz.h"     // TOPAZ
 #include "cmdhfvas.h"       // Value added services
 #include "cmdhfwaveshare.h" // Waveshare
+#include "cmdhfgoodisplay.h" // Goodisplay
 #include "cmdhfxerox.h"     // Xerox
 #include "cmdtrace.h"       // trace list
 #include "ui.h"
@@ -93,7 +95,7 @@ int CmdHFSearch(const char *Cmd) {
     uint8_t success[COUNT_OF_PROTOCOLS] = {0};
 
     PROMPT_CLEARLINE;
-    PrintAndLogEx(INPLACE, " Searching for ThinFilm tag...");
+    PrintAndLogEx(INPLACE, "Searching for ThinFilm tag...");
     if (IfPm3NfcBarcode()) {
         if (infoThinFilm(false) == PM3_SUCCESS) {
             PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("Thinfilm tag") " found\n");
@@ -103,7 +105,7 @@ int CmdHFSearch(const char *Cmd) {
     }
 
     PROMPT_CLEARLINE;
-    PrintAndLogEx(INPLACE, " Searching for Topaz tag...");
+    PrintAndLogEx(INPLACE, "Searching for Topaz tag...");
     if (IfPm3Iso14443a()) {
         if (readTopazUid(false, false) == PM3_SUCCESS) {
             PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("Topaz tag") " found\n");
@@ -113,7 +115,7 @@ int CmdHFSearch(const char *Cmd) {
     }
 
     PROMPT_CLEARLINE;
-    PrintAndLogEx(INPLACE, " Searching for LTO-CM tag...");
+    PrintAndLogEx(INPLACE, "Searching for LTO-CM tag...");
     if (IfPm3Iso14443a()) {
         if (reader_lto(false, false) == PM3_SUCCESS) {
             PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("LTO-CM tag") " found\n");
@@ -123,7 +125,7 @@ int CmdHFSearch(const char *Cmd) {
     }
 
     PROMPT_CLEARLINE;
-    PrintAndLogEx(INPLACE, " Searching for ISO14443-A tag...");
+    PrintAndLogEx(INPLACE, "Searching for ISO14443-A tag...");
     if (IfPm3Iso14443a()) {
         int sel_state = infoHF14A(false, false, false);
         if (sel_state > 0) {
@@ -152,7 +154,7 @@ int CmdHFSearch(const char *Cmd) {
     */
 
     PROMPT_CLEARLINE;
-    PrintAndLogEx(INPLACE, " Searching for LEGIC tag...");
+    PrintAndLogEx(INPLACE, "Searching for LEGIC tag...");
     if (IfPm3Legicrf()) {
         if (readLegicUid(false, false) == PM3_SUCCESS) {
             PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("LEGIC Prime tag") " found\n");
@@ -163,7 +165,7 @@ int CmdHFSearch(const char *Cmd) {
 
     // texkom
     PROMPT_CLEARLINE;
-    PrintAndLogEx(INPLACE, " Searching for TEXKOM tag...");
+    PrintAndLogEx(INPLACE, "Searching for TEXKOM tag...");
     if (read_texkom_uid(false, false) == PM3_SUCCESS) {
         PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("TEXKOM tag") " found\n");
         success[PROTO_TEXKOM] = true;
@@ -172,7 +174,7 @@ int CmdHFSearch(const char *Cmd) {
 
     // xerox
     PROMPT_CLEARLINE;
-    PrintAndLogEx(INPLACE, " Searching for Fuji/Xerox tag...");
+    PrintAndLogEx(INPLACE, "Searching for Fuji/Xerox tag...");
     if (IfPm3Iso14443b()) {
         if (read_xerox_uid(false, false) == PM3_SUCCESS) {
             PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("Fuji/Xerox tag") " found\n");
@@ -183,7 +185,7 @@ int CmdHFSearch(const char *Cmd) {
 
     // 14b is the longest test
     PROMPT_CLEARLINE;
-    PrintAndLogEx(INPLACE, " Searching for ISO14443-B tag...");
+    PrintAndLogEx(INPLACE, "Searching for ISO14443-B tag...");
     if (IfPm3Iso14443b()) {
         if (readHF14B(false, false, false) == PM3_SUCCESS) {
             PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("ISO 14443-B tag") " found\n");
@@ -195,7 +197,7 @@ int CmdHFSearch(const char *Cmd) {
     // OBS!  This triggers a swap to FPGA_BITSTREAM_HF_15 == 1.5sec delay
 
     PROMPT_CLEARLINE;
-    PrintAndLogEx(INPLACE, " Searching for ISO15693 tag...");
+    PrintAndLogEx(INPLACE, "Searching for ISO15693 tag...");
     if (IfPm3Iso15693()) {
         if (readHF15Uid(false, true)) {
             PrintAndLogEx(SUCCESS, "Valid " _GREEN_("ISO 15693 tag") " found\n");
@@ -205,7 +207,7 @@ int CmdHFSearch(const char *Cmd) {
     }
 
     PROMPT_CLEARLINE;
-    PrintAndLogEx(INPLACE, " Searching for iCLASS / PicoPass tag...");
+    PrintAndLogEx(INPLACE, "Searching for iCLASS / PicoPass tag...");
     if (IfPm3Iclass()) {
         if (read_iclass_csn(false, false, false) == PM3_SUCCESS) {
             PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("iCLASS tag / PicoPass tag") " found\n");
@@ -217,7 +219,7 @@ int CmdHFSearch(const char *Cmd) {
     // OBS!  This triggers a swap to FPGA_BITSTREAM_HF_FELICA == 1.5sec delay
 
     PROMPT_CLEARLINE;
-    PrintAndLogEx(INPLACE, " Searching for FeliCa tag...");
+    PrintAndLogEx(INPLACE, "Searching for FeliCa tag...");
     if (IfPm3Felica()) {
         if (read_felica_uid(false, false) == PM3_SUCCESS) {
             PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("ISO 18092 / FeliCa tag") " found\n");
@@ -232,7 +234,7 @@ int CmdHFSearch(const char *Cmd) {
 
     /*
     PROMPT_CLEARLINE;
-    PrintAndLogEx(INPLACE, " Searching for CryptoRF tag...");
+    PrintAndLogEx(INPLACE, "Searching for CryptoRF tag...");
     if (IfPm3Iso14443b()) {
         if (readHFCryptoRF(false, false) == PM3_SUCCESS) {
             PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("CryptoRF tag") " found\n");
@@ -374,13 +376,13 @@ int CmdHFTune(const char *Cmd) {
         return PM3_ETIMEOUT;
     }
 
-    // All three modes of this command answer under the same command id 
+    // All three modes of this command answer under the same command id
     // and there is no sequence number
     if ((resp.status != PM3_SUCCESS) || (resp.length != 0)) {
         PrintAndLogEx(WARNING, "unexpected reply to HF initialization (status %d, %u bytes)",
                       resp.status,
                       (unsigned)resp.length
-                );
+                     );
     }
 
     mode[0] = 2;
@@ -645,6 +647,10 @@ static command_t CommandTable[] = {
     {"fmcos",       CmdHFFmcos,       AlwaysAvailable, "{ FMCOS CPU cards...                  }"},
     {"fudan",       CmdHFFudan,       AlwaysAvailable, "{ Fudan RFIDs...                      }"},
     {"gallagher",   CmdHFGallagher,   AlwaysAvailable, "{ Gallagher DESFire RFIDs...          }"},
+#ifdef HAVE_GD
+    {"goodisplay",  CmdHFGoodisplay,  AlwaysAvailable, "{ Goodisplay NFC ePaper...            }"},
+#endif
+    {"gp",          CmdHFGP,          AlwaysAvailable, "{ GlobalPlatform secure elements...   }"},
     {"gst",         CmdHFGST,         AlwaysAvailable, "{ Google Smart Tap passes...          }"},
     {"secc",        CmdHFHIDConfig,   AlwaysAvailable, "{ iClass SE Config Card Emulator...   }"},
     {"iclass",      CmdHFiClass,      AlwaysAvailable, "{ ICLASS RFIDs...                     }"},

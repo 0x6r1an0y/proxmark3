@@ -238,7 +238,6 @@ Check column "offline" for their availability.
 |`hf 14b wrbl            `|N       |`Write data to a SRI512/SRIX4 tag`
 |`hf 14b tearoff         `|N       |`Tear-off attack on ST25TB/SRx counter blocks`
 |`hf 14b view            `|Y       |`Display content from tag dump file`
-|`hf 14b valid           `|Y       |`SRIX4 checksum test`
 |`hf 14b ctdump          `|N       |`Dump ASK CTS/C-ticket`
 |`hf 14b ctrdbl          `|N       |`Read ASK CTS/C-ticket block`
 |`hf 14b setuid          `|N       |`Set UID for magic card`
@@ -254,6 +253,7 @@ Check column "offline" for their availability.
 |`hf 15 list             `|Y       |`List ISO-15693 history`
 |`hf 15 demod            `|Y       |`Demodulate ISO-15693 from tag`
 |`hf 15 dump             `|N       |`Read all memory pages of an ISO-15693 tag, save to file`
+|`hf 15 implant          `|Y       |`Read temperature from NTAG 5 link sensor implant`
 |`hf 15 info             `|N       |`Tag information`
 |`hf 15 sniff            `|N       |`Sniff ISO-15693 traffic`
 |`hf 15 raw              `|N       |`Send raw hex data to tag`
@@ -303,7 +303,7 @@ Check column "offline" for their availability.
 |command                  |offline |description
 |-------                  |------- |-----------
 |`hf calypso help        `|Y       |`This help`
-|`hf calypso info        `|N       |`Tag information`
+|`hf calypso info        `|Y       |`Tag information`
 |`hf calypso dump        `|N       |`Dump nodes after application profile scan`
 |`hf calypso probecmdcompat`|N       |`Probe SELECT command compatibility`
 |`hf calypso list        `|Y       |`List Calypso history`
@@ -372,7 +372,7 @@ Check column "offline" for their availability.
 |`hf felica sniff        `|N       |`Sniff ISO 18092/FeliCa traffic`
 |`hf felica wrbl         `|N       |`write block data to an authentication-not-required Service.`
 |`hf felica seacauth1    `|N       |`FeliCa SEAC Authentication1`
-|`hf felica dump         `|N       |`Wait for and try dumping FeliCa`
+|`hf felica dump         `|Y       |`Wait for and try dumping FeliCa`
 |`hf felica discnodes    `|N       |`discover Area Code and Service Code nodes.`
 |`hf felica sim          `|N       |`Emulate FeliCa Standard from dump file`
 |`hf felica rqservice    `|N       |`verify the existence of Area and Service, and to acquire Key Version.`
@@ -473,6 +473,28 @@ Check column "offline" for their availability.
 |`hf gallagher decode    `|Y       |`Decode Gallagher credential block`
 |`hf gallagher encode    `|Y       |`Encode Gallagher credential block`
 |`hf gallagher reader    `|N       |`Read & decode all Gallagher credentials on a DESFire or Classic card`
+
+
+### hf goodisplay
+
+ { Goodisplay NFC ePaper...            }
+
+|command                  |offline |description
+|-------                  |------- |-----------
+|`hf goodisplay help     `|Y       |`This help`
+|`hf goodisplay load     `|Y       |`Load image file to Goodisplay NFC ePaper`
+
+
+### hf gp
+
+ { GlobalPlatform secure elements...   }
+
+|command                  |offline |description
+|-------                  |------- |-----------
+|`hf gp help             `|Y       |`This help`
+|`hf gp aids             `|N       |`Find applet AIDs via partial SELECT walk`
+|`hf gp info             `|N       |`Read card info without authentication`
+|`hf gp crs              `|N       |`List contactless applets via the CRS registry`
 
 
 ### hf gst
@@ -658,6 +680,7 @@ Check column "offline" for their availability.
 |`hf mf rdbl             `|N       |`Read MIFARE Classic block`
 |`hf mf rdsc             `|N       |`Read MIFARE Classic sector`
 |`hf mf restore          `|N       |`Restore MIFARE Classic binary file to tag`
+|`hf mf sam              `|N       |`Extract PACS via a HID SAM`
 |`hf mf setmod           `|N       |`Set MIFARE Classic EV1 load modulation strength`
 |`hf mf value            `|Y       |`Value blocks`
 |`hf mf view             `|Y       |`Display content from tag dump file`
@@ -699,7 +722,7 @@ Check column "offline" for their availability.
 |`hf mf gdmgethidblk     `|N       |`Read hidden block from GDM card`
 |`hf mf gdmsethidblk     `|N       |`Write hidden block to GDM card`
 |`hf mf gdmsetuid        `|N       |`Set UID on GDM card`
-|`hf mf gdmwipe          `|N       |`Wipe GDM card to factory defaults`
+|`hf mf gdmwipe          `|N       |`Wipe GDM card to a clean template`
 |`hf mf gdmsetsig        `|N       |`Set MFC EV1 signature on GDM card`
 |`hf mf ndefformat       `|N       |`Format MIFARE Classic Tag as NFC Tag`
 |`hf mf ndefread         `|N       |`Read and print NDEF records from card`
@@ -748,12 +771,11 @@ Check column "offline" for their availability.
 |`hf mfu keygen          `|Y       |`Generate DES/3DES/AES MIFARE diversified keys`
 |`hf mfu pwdgen          `|Y       |`Generate pwd from known algos`
 |`hf mfu otptear         `|N       |`Tear-off test on OTP bits`
-|`hf mfu countertear     `|N       |`Tear-off test on Ev1/NTAG Counter bits`
+|`hf mfu countertear     `|N       |`Reset a Mifare UL EV1 counter with tear-off`
+|`hf mfu chk             `|N       |`Ultralight C/AES - Authentication dictionary check`
 |`hf mfu cauth           `|N       |`Ultralight-C - Authentication`
-|`hf mfu cchk            `|N       |`Ultralight-C - Authentication dictionary check`
 |`hf mfu desbrute        `|Y       |`Ultralight-C - 3DES key segment brute force`
 |`hf mfu aesauth         `|N       |`Ultralight-AES - Authentication`
-|`hf mfu aeschk          `|N       |`Ultralight-AES - Authentication dictionary check`
 |`hf mfu aesgetuid       `|N       |`Ultralight-AES - Get UID when RID in use`
 |`hf mfu setkey          `|N       |`Ultralight C/AES - Set 3DES/AES keys`
 |`hf mfu dump            `|N       |`Dump MIFARE Ultralight family tag to binary file`
@@ -794,6 +816,7 @@ Check column "offline" for their availability.
 |`hf mfdes getversion    `|N       |`Get version/type information`
 |`hf mfdes getuid        `|N       |`Get uid from card`
 |`hf mfdes pc            `|N       |`Run proximity check`
+|`hf mfdes sam           `|N       |`Extract PACS via a HID SAM`
 |`hf mfdes info          `|N       |`Tag information`
 |`hf mfdes mad           `|N       |`Prints MAD records / files from the card`
 |`hf mfdes setconfig     `|N       |`Set card configuration`
@@ -817,6 +840,12 @@ Check column "offline" for their availability.
 |`hf mfdes getfileisoids `|N       |`Get File ISO IDs list`
 |`hf mfdes lsfiles       `|N       |`Show all files list`
 |`hf mfdes dump          `|N       |`Dump all files`
+|`hf mfdes view          `|Y       |`Display content from tag dump file`
+|`hf mfdes eload         `|N       |`Upload file into emulator memory`
+|`hf mfdes esave         `|N       |`Save emulator memory to file`
+|`hf mfdes eview         `|N       |`View emulator memory`
+|`hf mfdes sim           `|N       |`Simulate DESFire card from emulator memory`
+|`hf mfdes etest         `|N       |`Drive the simulation from the host, no RF`
 |`hf mfdes createfile    `|N       |`Create Standard/Backup File`
 |`hf mfdes createvaluefile`|N       |`Create Value File`
 |`hf mfdes createrecordfile`|N       |`Create Linear/Cyclic Record File`
@@ -851,6 +880,8 @@ Check column "offline" for their availability.
 |`hf ntag424 getfs       `|N       |`Get file settings`
 |`hf ntag424 changefs    `|N       |`Change file settings`
 |`hf ntag424 changekey   `|N       |`Change key`
+|`hf ntag424 gettt       `|N       |`Get Tag Tamper status`
+|`hf ntag424 setconfig   `|N       |`Set PICC configuration option`
 
 
 ### hf saflok
@@ -938,8 +969,9 @@ Check column "offline" for their availability.
 |-------                  |------- |-----------
 |`hf thinfilm help       `|Y       |`This help`
 |`hf thinfilm info       `|N       |`Tag information`
-|`hf thinfilm list       `|Y       |`List NFC Barcode / Thinfilm history - not correct`
+|`hf thinfilm list       `|Y       |`List NFC Barcode / Thinfilm history`
 |`hf thinfilm sim        `|N       |`Fake Thinfilm tag`
+|`hf thinfilm sniff      `|N       |`Sniff Thinfilm tag communication`
 
 
 ### hf topaz
@@ -1022,6 +1054,7 @@ Check column "offline" for their availability.
 |`hw lcd                 `|N       |`Send command/data to LCD`
 |`hw lcdreset            `|N       |`Hardware reset LCD`
 |`hw ping                `|N       |`Test if the Proxmark3 is responsive`
+|`hw powersave           `|N       |`Enable/disable the PM5 power-save idle`
 |`hw readmem             `|N       |`Read from MCU flash`
 |`hw reset               `|N       |`Reset the device`
 |`hw setlfdivisor        `|N       |`Drive LF antenna at 12MHz / (divisor + 1)`
@@ -1040,12 +1073,30 @@ Check column "offline" for their availability.
 |command                  |offline |description
 |-------                  |------- |-----------
 |`hw bwm help            `|Y       |`This help`
-|`hw bwm autooff         `|N       |`Toggle auto power-off on USB unplug`
+|`hw bwm autooff         `|N       |`Show/set auto power-off (USB unplug, idle on battery)`
 |`hw bwm charge          `|N       |`Enable/disable battery charging (one-shot)`
+|`hw bwm name            `|N       |`Get/set the BWM BLE advertising name`
+|`hw bwm powersave       `|N       |`Show/set the BWM power-save switch (DFS, light sleep, slow adv)`
 |`hw bwm setcap          `|N       |`Set fuel-gauge design capacity (run once after battery change)`
 |`hw bwm upgrade         `|N       |`Reflash BWM (ESP32) firmware over the BWM link, no header`
-|`hw bwm vchg            `|N       |`Set charger charge-voltage target (default 4100 mV)`
+|`hw bwm vchg            `|N       |`Set charger charge-voltage target (default 4200 mV)`
 |`hw bwm wifi            `|N       |`Bring up WiFi (STA + TCP server) for a tcp: connection`
+|`hw bwm wifipower       `|N       |`WiFi fully off, or the modem power-save type (none/min/max)`
+
+
+### hw bwm ble
+
+ { BLE: on/off, pairing, bonded devices, TX power... }
+
+|command                  |offline |description
+|-------                  |------- |-----------
+|`hw bwm ble help        `|Y       |`This help`
+|`hw bwm ble status      `|N       |`Show BLE settings: on/off, pairing, bonded devices, TX power`
+|`hw bwm ble on          `|N       |`Switch BLE on (persisted)`
+|`hw bwm ble off         `|N       |`Switch BLE off (persisted) - nothing can connect`
+|`hw bwm ble pairing     `|N       |`Require pairing with a passkey, set the passkey`
+|`hw bwm ble forget      `|N       |`Remove bonded devices`
+|`hw bwm ble txpower     `|N       |`Set advertising / connection TX power`
 
 
 ### lf
@@ -1080,7 +1131,6 @@ Check column "offline" for their availability.
 |`lf awid demod          `|Y       |`demodulate an AWID FSK tag from the GraphBuffer`
 |`lf awid reader         `|N       |`attempt to read and extract tag data`
 |`lf awid sim            `|N       |`simulate AWID tag`
-|`lf awid brute          `|N       |`bruteforce card number against reader`
 |`lf awid watch          `|N       |`continuously watch for cards.  Reader mode`
 
 
@@ -1093,6 +1143,7 @@ Check column "offline" for their availability.
 |`lf cotag help          `|Y       |`This help`
 |`lf cotag demod         `|Y       |`demodulate a COTAG tag`
 |`lf cotag reader        `|N       |`attempt to read and extract tag data`
+|`lf cotag sim           `|N       |`simulate a COTAG tag`
 
 
 ### lf destron
@@ -1207,7 +1258,7 @@ Check column "offline" for their availability.
 |-------                  |------- |-----------
 |`lf fdxb help           `|Y       |`this help`
 |`lf fdxb demod          `|Y       |`demodulate a FDX-B ISO11784/85 tag from the GraphBuffer`
-|`lf fdxb reader         `|N       |`attempt to read at 134kHz and extract tag data`
+|`lf fdxb reader         `|N       |`attempt to read at 134 kHz, then 125 kHz, and extract tag data`
 |`lf fdxb clone          `|N       |`clone animal ID tag to T55x7, Q5/T5555 or EM4305/4469`
 |`lf fdxb sim            `|N       |`simulate Animal ID tag`
 
@@ -1309,6 +1360,19 @@ Check column "offline" for their availability.
 |`lf hitag htu dump      `|N       |`Dump Hitag µ blocks to a file`
 |`lf hitag htu wrbl      `|N       |`Write Hitag µ block`
 |`lf hitag htu sim       `|N       |`Simulate Hitag µ transponder`
+
+
+### lf ict
+
+ { ICT RFIDs...               }
+
+|command                  |offline |description
+|-------                  |------- |-----------
+|`lf ict help            `|Y       |`This help`
+|`lf ict demod           `|Y       |`demodulate an LF ICT FSK tag from the GraphBuffer`
+|`lf ict reader          `|N       |`attempt to read and extract tag data`
+|`lf ict clone           `|N       |`clone LF ICT tag to T55x7, Q5/T5555 or EM4305/4469`
+|`lf ict sim             `|N       |`simulate LF ICT tag`
 
 
 ### lf idteck
@@ -1589,6 +1653,19 @@ Check column "offline" for their availability.
 |`lf visa2000 sim        `|N       |`simulate Visa2000 tag`
 
 
+### lf watchnet
+
+ { WatchNET RFIDs...          }
+
+|command                  |offline |description
+|-------                  |------- |-----------
+|`lf watchnet help       `|Y       |`This help`
+|`lf watchnet demod      `|Y       |`demodulate a WatchNET FSK tag from the GraphBuffer`
+|`lf watchnet reader     `|N       |`attempt to read and extract tag data`
+|`lf watchnet clone      `|N       |`clone WatchNET tag to T55x7, Q5/T5555 or EM4305/4469`
+|`lf watchnet sim        `|N       |`simulate WatchNET tag`
+
+
 ### mad
 
  { MAD commands... }
@@ -1787,6 +1864,7 @@ Check column "offline" for their availability.
 |command                  |offline |description
 |-------                  |------- |-----------
 |`trace help             `|Y       |`This help`
+|`trace clear            `|Y       |`Clear the client side trace buffer`
 |`trace extract          `|Y       |`Extract authentication challenges found in trace`
 |`trace list             `|Y       |`List protocol data in trace buffer`
 |`trace load             `|Y       |`Load trace from file`
@@ -1820,6 +1898,7 @@ Check column "offline" for their availability.
 |`wiegand list           `|Y       |`List available wiegand formats`
 |`wiegand encode         `|Y       |`Encode to wiegand raw hex (currently for HID Prox)`
 |`wiegand decode         `|Y       |`Convert raw hex to decoded wiegand format (currently for HID Prox)`
+|`wiegand downgrade      `|Y       |`Downgrade a HID credential to iCLASS, MIFARE Classic or HID Prox`
 
 
 Full help dump done.

@@ -327,6 +327,13 @@ void FpgaSendCommand(uint16_t cmd, uint16_t v);
 //-----------------------------------------------------------------------------
 void FpgaWriteConfWord(uint16_t v);
 
+#ifdef PM5
+//-----------------------------------------------------------------------------
+// True when the last configuration word selected FPGA_MAJOR_MODE_OFF.
+//-----------------------------------------------------------------------------
+bool FpgaIsOff(void);
+#endif
+
 //-----------------------------------------------------------------------------
 // enable FPGA internal tracing
 //-----------------------------------------------------------------------------
@@ -407,6 +414,8 @@ int FpgaStopConfig(void);
 uint32_t FpgaConfigPlatformStatus(void);
 
 #ifdef PM5
+// Usercode of the running image, false when unknown
+bool Fpga_get_usercode(uint32_t *usercode);
 #include "fpga_hw_at32.h"
 #else
 #include "fpga_hw_at91.h"

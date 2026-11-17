@@ -27,6 +27,13 @@
 #define BWM_UART_BAUD_TARGET   921600
 #endif
 
+// Faster rate, only once the ESP accepted per-host forwarding (its fw drains the RX
+// FIFO early enough for it and falls back to 921600 on its own when a host such as
+// the bootrom talks slower). 0 disables. ESP side: 26 MHz XTAL / 17.3 = 1.5018 Mbaud.
+#ifndef BWM_UART_BAUD_FAST
+#define BWM_UART_BAUD_FAST     1500000
+#endif
+
 void bwm_uart_init(void);
 
 // Re-init UART4 + RX DMA at a new baud (used by the runtime baud negotiation).
@@ -36,7 +43,17 @@ void bwm_uart_set_baud(uint32_t baud);
 // Baud the link is currently running at (updated by bwm_uart_set_baud).
 uint32_t bwm_uart_get_baud(void);
 
+// Re-derive the baud divider for the current APB1 clock. Called on every core
+// clock switch (pm5_power.c); the divider set at 288 MHz is 6x off at 48 MHz.
+void bwm_uart_clock_update(void);
+
+// Blocking write of one whole frame. On the first write, and after ~1 s without
+// a write of our own, it first sends a wake preamble for the ESP's light sleep
+// and waits ~10 ms (see the BWM_ESP_* defines in bwm_uart_at32.c).
 int bwm_uart_write(const uint8_t *data, size_t len);
+
+// Lead the next write with the wake preamble, whatever the quiet time.
+void bwm_uart_wake_next(void);
 
 uint16_t bwm_uart_rx_available(void);
 

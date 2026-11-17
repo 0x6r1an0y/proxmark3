@@ -342,6 +342,11 @@ void loadT55xxConfig(void) {
 #ifdef WITH_FLASH
 
     uint8_t *buf = BigBuf_calloc(T55XX_CONFIG_LEN);
+    if (buf == NULL) {
+        if (g_dbglevel >= DBG_ERROR) DbpString("loadT55xxConfig: failed to allocate buffer");
+        BigBuf_free();
+        return;
+    }
 
     uint32_t size = 0;
     if (exists_in_spiffs(T55XX_CONFIG_FILE)) {
@@ -536,7 +541,7 @@ void ReadTItag(bool ledcontrol) {
 #define FREQHI 134200
 
     signed char *dest = (signed char *)BigBuf_get_addr();
-    uint16_t n = BigBuf_max_traceLen();
+    uint32_t n = BigBuf_max_traceLen();
     // 128 bit shift register [shift3:shift2:shift1:shift0]
     uint32_t shift3 = 0, shift2 = 0, shift1 = 0, shift0 = 0;
 
@@ -2948,6 +2953,12 @@ void Cotag(uint32_t arg0, bool ledcontrol) {
         }
         case 1: {
             uint8_t *dest = BigBuf_calloc(COTAG_BITS);
+            if (dest == NULL) {
+                if (g_dbglevel >= DBG_ERROR) DbpString("cotag: failed to allocate buffer");
+                reply_ng(CMD_LF_COTAG_READ, PM3_EMALLOC, NULL, 0);
+                break;
+            }
+
             uint16_t bits = doCotagAcquisitionManchester(dest, COTAG_BITS);
             reply_ng(CMD_LF_COTAG_READ, PM3_SUCCESS, dest, bits);
             break;
@@ -2967,6 +2978,413 @@ void Cotag(uint32_t arg0, bool ledcontrol) {
     // Turn the field off
     FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
     if (ledcontrol) LEDsoff();
+}
+
+#define COTAG_STEP_K 32 // samples per box of the step filter
+
+// a detected activation, for debug output
+typedef struct {
+    uint32_t dt;    // samples between the two rises
+    int32_t thr;    // threshold the second rise crossed
+} cotag_detect_val_t;
+
+// Block until the reader's activation sequence is detected. Return false on button press or USB data.
+//     - *peak is to carry the adaptive threshold across calls
+static bool cotag_activation_sequence_detect(const lf_cotagsim_t *params, int32_t *peak, cotag_detect_val_t *out) {
+
+    // Known COTAG reader's tag activation sequence variants:
+    // a)
+    //   - ON 800 us, OFF 2200 us
+    //   - ON ~5800 us      (the tag is expected to respond in this window)
+    //   - OFF ~16500 us    (reader's pause if no tag detected, then repeat)
+    // b)
+    //   - ON(850),OFF(2200),  // 1st activation
+    //   - ON(3600),           // tags can (will) respond, but the reader will not listen
+    //   - OFF(2200),
+    //   - ON(850),OFF(2200),  // 2nd activation
+    //   - ON(3600),           // tags expected to respond, the reader will listen (extend the field)
+    //   - OFF PAUSE ~16300
+    // c)
+    //   - ON(1500),OFF(1900),
+    //   - ON(Z)
+    //   - if a tag responds, then field dropped early, OFF(20000), and additional:
+    //   - ON(1500),OFF(1900),
+    //   - ON(Z)
+    //
+    // We detect 2 rising edges delta between ON(X),OFF(Y),ON(Z).
+    // Plus minus some tolerance, thus win_lo and win_hi.
+
+    // Number of samples between 2 rising edges to look for an activation sequence:
+    const uint32_t win_lo = 2700 * 12 / (LF_COTAG_DIVISOR + 1);
+    const uint32_t win_hi = 3700 * 12 / (LF_COTAG_DIVISOR + 1);
+
+    // Samples ring buffer
+    uint8_t ring[2 * COTAG_STEP_K] = {0};
+    uint8_t idx = 0;                        // points to the oldest sample
+    int32_t sum_new = 0, sum_old = 0;       // sum of the newest (oldest) COTAG_STEP_K samples
+
+    int32_t peak_recent_step = *peak; // peak of step, scaled by 65536 so the decay below cannot truncate to zero
+    uint32_t sample_cnt = 0;
+    uint32_t last_rise = 0;           // sample_cnt at the previous detected rising edge
+    bool armed = true;
+    uint16_t checked = 0;
+
+    for (;;) {
+        WDT_HIT();
+
+        if (++checked >= 4000) {
+            checked = 0;
+            if (BUTTON_PRESS() || data_available()) {
+                return false;
+            }
+        }
+
+        if (FPGA_SSC_RX_Ready() == false) {
+            continue;
+        }
+
+        uint8_t sample = FPGA_SSC_RX_Value();
+
+        // Recalculate sum_new and sum_old.
+        // sample (new) added to sum_new; mid subtracted from sum_new and added to sum_old,
+        // ring[idx] (oldest) subtracted from sum_old and discarded.
+        uint8_t mid = ring[(idx + COTAG_STEP_K) % (2 * COTAG_STEP_K)];
+        sum_new += sample - mid;
+        sum_old += mid - ring[idx];
+        ring[idx] = sample;
+        idx = (idx + 1) % (2 * COTAG_STEP_K);
+
+        if (++sample_cnt < 2 * COTAG_STEP_K) {
+            continue;  // wait for the ring buffer to fill up first
+        }
+
+        // Step filter
+        int32_t step = sum_new - sum_old;
+        if (step * 65536 > peak_recent_step) {
+            peak_recent_step = step * 65536;   // attack at once
+        } else {
+            peak_recent_step -= peak_recent_step >> 13; // release slowly, tau 2^13 samples
+        }
+
+        // use threshold as half the recent peak step (adapting to reader distance)
+        // (undo scaling by 65536 aka 2^16, then divide by 2: thus >> 17)
+        int32_t thr = MAX(params->thr_floor, peak_recent_step >> 17);
+
+        // Rising edge detection: Schmitt trigger so that we get one event per rise:
+        // trigger once when step >= thr, then disarm, only re-arm if step falls below thr/4
+        if (armed && step >= thr) {
+            armed = false;
+            uint32_t dt = sample_cnt - last_rise; // number of samples since the previous rise
+
+            if (last_rise && dt >= win_lo && dt <= win_hi) {
+                // Activation sequence detected
+                out->dt = dt;
+                out->thr = thr;
+                *peak = peak_recent_step;
+                return true;
+            }
+            last_rise = sample_cnt;
+
+        } else if (step <= thr / 4) {
+            // step enough below the thr, re-arm Schmitt trigger
+            armed = true;
+        }
+    }
+}
+
+#define COTAG_TX_HALFBIT_CARRIERS 384                             // reader carrier cycles per half bit
+#define COTAG_TX_HALFBIT_SAMPLES  (COTAG_TX_HALFBIT_CARRIERS / 2) // samples per half bit at the 66 kHz TX divisor
+
+#define COTAG_TX_SYNC_HALFBITS    4                               // two leading sync 0 bits
+#define COTAG_TX_MAX_HALFBITS     (COTAG_TX_SYNC_HALFBITS + 2 * 8 * LF_COTAG_SIM_DATA_LEN)
+
+#define COTAG_CARRIER_TIMEOUT     17  // precision counter ticks (1.5 MHz) for approx 1.5 carrier periods at 132 kHz
+#define COTAG_FIELD_LOST          64  // consecutive missed carrier edges threshold for determining the reader field is gone
+
+// a passive answer, for debug output
+typedef struct {
+    uint32_t missed_edges;  // carrier edges missed, replaced by the timeout
+    uint16_t nhb_sent;      // num half bits sent
+    bool field_lost;        // stopped because the reader field went away
+} cotag_tx_val_t;
+
+#define COTAG_SSC_STALL          100000
+#define COTAG_SETTLE_US          10000
+
+// Discard count samples ("wait count samples"). Return false on error.
+static bool cotag_skip_samples(uint32_t count) {
+    while (count--) {
+        uint32_t guard = 0;
+        while (FPGA_SSC_RX_Ready() == false) {
+            if (++guard > COTAG_SSC_STALL) {
+                return false;
+            }
+        }
+        (void)FPGA_SSC_RX_Value();
+    }
+    return true;
+}
+
+static uint16_t cotag_build_halfbits(uint8_t *half_bits, const uint8_t *data, uint8_t nbits) {
+
+    // Two leading/sync 0 bits, manchester encoded
+    half_bits[0] = 0;
+    half_bits[1] = 1;
+    half_bits[2] = 0;
+    half_bits[3] = 1;
+
+    uint16_t nhb = COTAG_TX_SYNC_HALFBITS;
+    for (uint8_t i = 0; i < nbits; i++) {
+        // bits in reverse order:
+        uint8_t src = nbits - 1 - i;
+        uint8_t bit = (data[src >> 3] >> (7 - (src & 7))) & 1;
+        // manchester encode the bit:
+        half_bits[nhb++] = bit;
+        half_bits[nhb++] = bit ^ 1;
+    }
+    return nhb;
+}
+
+// Send COTAG frame's half bits with "active tx".
+// May give better range but may not work with all types of readers.
+// Return false on button press, USB data, or error.
+static bool cotag_tx_frame_active(const uint8_t *half_bits, uint16_t nhb, uint8_t repeats, uint16_t hb_delay_us) {
+
+    Gpio_SSC_DOUT_High();
+    FpgaSendCommand(FPGA_CMD_SET_DIVISOR, LF_COTAG_TX_DIVISOR);
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_LF_ADC | FPGA_LF_ADC_READER_FIELD);
+
+    bool ok = true;
+    for (uint8_t r = 0; r < repeats && ok; r++) {
+        // Send precomputed half bits. Leading sync bits are sent only at first repetition
+        for (uint16_t i = (r == 0) ? 0 : COTAG_TX_SYNC_HALFBITS; i < nhb; i++) {
+            if (half_bits[i]) {
+                Gpio_SSC_DOUT_Low();
+            } else {
+                Gpio_SSC_DOUT_High();
+            }
+
+            if (hb_delay_us) {
+                SpinDelayUsPrecision(hb_delay_us);
+            } else if (cotag_skip_samples(COTAG_TX_HALFBIT_SAMPLES) == false) {
+                ok = false;
+                break;
+            }
+
+            if (BUTTON_PRESS()) {
+                ok = false;
+                break;
+            }
+        }
+
+        WDT_HIT();
+        if (data_available()) {
+            ok = false;
+            break;
+        }
+    }
+
+    Gpio_SSC_DOUT_High();
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_LF_ADC);
+    Gpio_SSC_DOUT_Low();  // back to "listening"
+    return ok;
+}
+
+// Wait for the next rising edge of cross_lo, one reader carrier cycle after t_last_edge.
+// Return false on timeout: reader field gone or the edge was missed (e.g. hidden by our own load).
+static bool cotag_wait_carrier(uint16_t t_last_edge) {
+    while (Gpio_SSC_CLK_Read()) {
+        if (GetPrecisionCounterDelta(t_last_edge) > COTAG_CARRIER_TIMEOUT) {
+            return false;
+        }
+    }
+    while (Gpio_SSC_CLK_Read() == false) {
+        if (GetPrecisionCounterDelta(t_last_edge) > COTAG_CARRIER_TIMEOUT) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Send COTAG frame's half bits, load modulating with an fc/2 subcarrier clocked by the
+// reader's carrier (cross_lo): subcarrier on for a high half bit, off for a low one.
+//
+// If reader field is gone before all half bits are sent, true is returned and tx_val->field_lost is set.
+// Return false on button press or USB data.
+static bool cotag_tx_frame_passive(const uint8_t *half_bits, uint16_t nhb, uint8_t repeats, cotag_tx_val_t *tx_val) {
+    Gpio_SSC_DOUT_Low();
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_LF_EDGE_DETECT);
+    gpio_fpga_mod_feedback_setup();
+
+    bool ok = true;
+    uint8_t lost = 0;
+    uint16_t t_last_edge = GetPrecisionCounterRaw();
+
+    for (uint8_t r = 0; r < repeats && ok; r++) {
+        // Send precomputed half bits. Leading sync bits are sent only at first repetition
+        for (uint16_t i = (r == 0) ? 0 : COTAG_TX_SYNC_HALFBITS; i < nhb; i++) {
+
+            // Modulate the current half bit:
+            for (uint16_t c = 0; c < COTAG_TX_HALFBIT_CARRIERS; c++) {
+                // Determine the level before the edge, so that we write it right after it:
+                //   - half bit high: toggle the load every carrier cycle (fc/2)
+                //   - half bit low:  unloaded for the whole half bit
+                bool loaded = half_bits[i] && (c & 1);
+
+                bool edge = cotag_wait_carrier(t_last_edge);
+                if (loaded) {
+                    Gpio_SSC_DOUT_High();
+                } else {
+                    Gpio_SSC_DOUT_Low();
+                }
+                t_last_edge = GetPrecisionCounterRaw();
+
+                if (edge) {
+                    lost = 0;
+                } else {
+                    tx_val->missed_edges++;
+                    if (++lost >= COTAG_FIELD_LOST) {
+                        tx_val->field_lost = true;
+                        // reader field gone: back to listening for the next activation
+                        goto out;
+                    }
+                }
+            }
+            tx_val->nhb_sent++;
+
+            if (BUTTON_PRESS()) {
+                ok = false;
+                break;
+            }
+        }
+
+        WDT_HIT();
+        if (data_available()) {
+            ok = false;
+        }
+    }
+
+out:
+    Gpio_SSC_DOUT_Low();
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_LF_ADC);
+    FpgaSetupSsc(FPGA_MAJOR_MODE_LF_READER);
+    gpio_fpga_mod_only_setup();
+    Gpio_SSC_DOUT_Low();  // back to "listening"
+    return ok;
+}
+
+// Debug print of a detected activation and its answer
+static void cotag_sim_report(const lf_cotagsim_t *params, uint8_t nbits, uint16_t nhb, const cotag_detect_val_t *val, const cotag_tx_val_t *tx_val) {
+    if (params->verbose == false && nbits) {
+        return;
+    }
+
+    Dbprintf("COTAG reader activation sequence detected");
+    if (g_dbglevel >= DBG_DEBUG) {
+        Dbprintf("  rise-to-rise " _YELLOW_("%u") " us, threshold %d", val->dt * (LF_COTAG_DIVISOR + 1) / 12, val->thr);
+    }
+
+    if (params->active == false && nbits) {
+        uint16_t total = nhb + (params->repeats - 1) * (nhb - COTAG_TX_SYNC_HALFBITS);
+        if (tx_val->field_lost) {
+            Dbprintf("  Answer stopped after " _YELLOW_("%u") " of %u half bits, reader field gone", tx_val->nhb_sent, total);
+        } else {
+            Dbprintf("  Sent " _YELLOW_("%u") " of %u half bits", tx_val->nhb_sent, total);
+            if (g_dbglevel >= DBG_DEBUG) Dbprintf("  missed carrier edges %u", tx_val->missed_edges);
+        }
+    }
+}
+
+void SimulateCotag(const lf_cotagsim_t *params, bool ledcontrol) {
+
+    LFSetupFPGAForADC(LF_COTAG_DIVISOR, false);
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_LF_ADC);
+    gpio_fpga_mod_only_setup();
+    Gpio_SSC_DOUT_Low();
+
+    BigBuf_free();
+    BigBuf_Clear_ext(false);
+
+    uint8_t *half_bits = BigBuf_calloc(COTAG_TX_MAX_HALFBITS);
+    if (half_bits == NULL) {
+        if (g_dbglevel >= DBG_ERROR) DbpString("SimulateCotag: failed to allocate buffer");
+        FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+        return;
+    }
+
+    uint8_t nbits = MIN(params->nbits, 8 * LF_COTAG_SIM_DATA_LEN);
+
+    // Precompute the Manchester halfbits to send
+    uint16_t nhb = cotag_build_halfbits(half_bits, params->data, nbits);
+
+    const uint32_t settle = COTAG_SETTLE_US * 12 / (LF_COTAG_DIVISOR + 1);
+
+    if (params->active == false) {
+        StartPrecisionCounter();
+    }
+
+    cotag_detect_val_t val;
+    int32_t peak = 0;
+
+    // Report of a field-lost answer, printed after the next answer
+    cotag_detect_val_t prev_val;
+    cotag_tx_val_t prev_tx;
+    bool deferred = false;
+
+    while (cotag_activation_sequence_detect(params, &peak, &val)) {
+        cotag_tx_val_t tx_val = {0};
+
+        if (nbits) {
+            if (ledcontrol) LED_C_ON();
+
+            // Transmit frame
+            bool ok = params->active
+                      ? cotag_tx_frame_active(half_bits, nhb, params->repeats, params->hb_delay_us)
+                      : cotag_tx_frame_passive(half_bits, nhb, params->repeats, &tx_val);
+
+            if (ledcontrol) LED_C_OFF();
+
+            if (ok == false) {
+                break;
+            }
+
+            // Done transmitting. Back to our RX sampling divisor:
+            FpgaSendCommand(FPGA_CMD_SET_DIVISOR, LF_COTAG_DIVISOR);
+
+            if (tx_val.field_lost) {
+                // With some readers, we may have reacted to the first activation, but the reader
+                // will honor our answer only in the second activation that follows shortly
+                // afterwards. Thus, no settle, and no blocking USB print before listening again.
+                if (deferred == false) {
+                    prev_val = val;
+                    prev_tx = tx_val;
+                    deferred = true;
+                    continue;
+                }
+            } else if (params->active) {
+                cotag_skip_samples(settle);
+            }
+        }
+
+        // Debug print only after done TXing frame
+        if (deferred) {
+            cotag_sim_report(params, nbits, nhb, &prev_val, &prev_tx);
+            deferred = false;
+        }
+        cotag_sim_report(params, nbits, nhb, &val, &tx_val);
+    }
+
+    if (deferred) {
+        cotag_sim_report(params, nbits, nhb, &prev_val, &prev_tx);
+    }
+
+    if (params->active == false) {
+        StopPrecisionCounter();
+    }
+
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+    if (ledcontrol) LEDsoff();
+    BigBuf_free();
 }
 
 /*

@@ -746,7 +746,7 @@ static void set_my_executable_path(void) {
     if (wai_getExecutablePath(my_executable_path, path_length, &dirname_length) != -1) {
         my_executable_path[path_length] = '\0';
         my_executable_directory = (char *)calloc(dirname_length + 2, sizeof(uint8_t));
-        if (my_executable_path == NULL) {
+        if (my_executable_directory == NULL) {
             PrintAndLogEx(WARNING, "Failed to allocate memory");
             return;
         }
@@ -964,7 +964,8 @@ finish2:
     clearCommandBuffer();
     if (in_bootloader) {
         g_session.current_device->g_conn->run = false;
-        SendCommandBL(CMD_PING, 0, 0, 0, NULL, 0);
+        // Wake the comm thread with a command supported by the bootrom.
+        SendCommandBL(CMD_DEVICE_INFO, 0, 0, 0, NULL, 0);
     } else {
         SendCommandNG(CMD_QUIT_SESSION, NULL, 0);
         msleep(100);
@@ -977,12 +978,14 @@ finish:
     } else if (ret == PM3_EOPABORTED) {
         PrintAndLogEx(FAILED, "Aborted by user");
     } else {
-        PrintAndLogEx(ERR, "Aborted on error %u", ret);
+        PrintAndLogEx(ERR, "Aborted on error %d", ret);
     }
     return ret;
 }
 
-static int flash_pm3(char *serial_port_name, uint8_t num_files, const char *filenames[FLASH_MAX_FILES], bool can_write_bl, bool force) {
+#endif //LIBPM3
+
+int flash_pm3(char *serial_port_name, uint8_t num_files, const char *filenames[], bool can_write_bl, bool force) {
 
     int ret = PM3_EUNDEF;
     flash_file_t files[FLASH_MAX_FILES] = {0};
@@ -994,14 +997,19 @@ static int flash_pm3(char *serial_port_name, uint8_t num_files, const char *file
     }
 
     for (int i = 0 ; i < num_files; ++i) {
-        char *path;
-        ret = searchFile(&path, FIRMWARES_SUBDIR, filenames[i], ".elf", true);
-        if (ret != PM3_SUCCESS) {
-            ret = searchFile(&path, BOOTROM_SUBDIR, filenames[i], ".elf", true);
-        }
-        if (ret != PM3_SUCCESS) {
-            // Last try, let the error msg be displayed if not found
-            ret = searchFile(&path, FULLIMAGE_SUBDIR, filenames[i], ".elf", false);
+        char *path = NULL;
+        // Don't let searchFile append ".elf" onto an already-copied path.
+        if (path_is_regular_file(filenames[i])) {
+            path = str_dup(filenames[i]);
+            ret = (path == NULL) ? PM3_EMALLOC : PM3_SUCCESS;
+        } else {
+            ret = searchFile(&path, FIRMWARES_SUBDIR, filenames[i], ".elf", true);
+            if (ret != PM3_SUCCESS) {
+                ret = searchFile(&path, BOOTROM_SUBDIR, filenames[i], ".elf", true);
+            }
+            if (ret != PM3_SUCCESS) {
+                ret = searchFile(&path, FULLIMAGE_SUBDIR, filenames[i], ".elf", false);
+            }
         }
         if (ret != PM3_SUCCESS) {
             goto finish2;
@@ -1063,7 +1071,11 @@ finish:
         PrintAndLogEx(WARNING, "The flashing procedure failed, follow the suggested steps!");
     }
 
-    ret = flash_stop_flashing();
+    // the reset must not hide the error that ended the flashing
+    int stop_ret = flash_stop_flashing();
+    if (ret == PM3_SUCCESS) {
+        ret = stop_ret;
+    }
     CloseProxmark(g_session.current_device);
 
 finish2:
@@ -1083,6 +1095,7 @@ finish2:
     return ret;
 }
 
+#ifndef LIBPM3
 static int reboot_bootloader_pm3(char *serial_port_name) {
     if (serial_port_name == NULL) {
         PrintAndLogEx(ERR, "You must specify a port.\n");
@@ -1454,7 +1467,7 @@ int main(int argc, char *argv[]) {
             }
             long int ncpus = strtol(argv[i + 1], NULL, 10);
             const int detected_cpus = detect_num_CPUs();
-            if (ncpus < 0 || ncpus >= detected_cpus) {
+            if (ncpus < 0 || ncpus > detected_cpus) {
                 PrintAndLogEx(ERR, _RED_("ERROR:") " invalid number of CPU cores: --ncpu " _YELLOW_("%s") " (available: %d)\n", argv[i + 1], detected_cpus);
                 return 1;
             }
@@ -1491,18 +1504,18 @@ int main(int argc, char *argv[]) {
     }
 
     if (dumpmem_mode) {
-        dumpmem_pm3(port, dumpmem_filename, dumpmem_addr, dumpmem_len, dumpmem_raw);
-        exit(EXIT_SUCCESS);
+        int ret = dumpmem_pm3(port, dumpmem_filename, dumpmem_addr, dumpmem_len, dumpmem_raw);
+        exit((ret == PM3_SUCCESS) ? EXIT_SUCCESS : EXIT_FAILURE);
     }
 
     if (flash_mode) {
-        flash_pm3(port, flash_num_files, flash_filenames, flash_can_write_bl, flash_force);
-        exit(EXIT_SUCCESS);
+        int ret = flash_pm3(port, flash_num_files, flash_filenames, flash_can_write_bl, flash_force);
+        exit((ret == PM3_SUCCESS) ? EXIT_SUCCESS : EXIT_FAILURE);
     }
 
     if (reboot_bootloader_mode) {
-        reboot_bootloader_pm3(port);
-        exit(EXIT_SUCCESS);
+        int ret = reboot_bootloader_pm3(port);
+        exit((ret == PM3_SUCCESS) ? EXIT_SUCCESS : EXIT_FAILURE);
     }
 
     if (script_cmd) {

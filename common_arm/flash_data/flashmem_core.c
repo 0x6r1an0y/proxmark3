@@ -5,6 +5,7 @@
 
 #ifndef AS_BOOTROM
 #include "dbprint.h"
+#include "commonutil.h"   // sprint_bytes
 #endif // AS_BOOTROM
 
 // default is 0, first set when FlashInit() call.
@@ -106,12 +107,15 @@ uint16_t Flash_WriteData(uint32_t address, uint8_t *in, uint16_t len) {
 
 // assumes valid start 256 based 00 address
 // Start writing flash from the specified location.
-// Write FLASH_MEM_BLOCK_SIZE bytes at most each time. If the writing is nearly complete, write it as bytes_remaining bytes.
+// Write FLASH_MEM_BLOCK_SIZE bytes at most each time.
+// If the writing is nearly complete, write it as bytes_remaining bytes.
 uint16_t Flash_Write(uint32_t address, uint8_t *in, uint16_t len) {
 
-    bool isok;
-    uint16_t res, bytes_sent = 0, bytes_remaining = len;
-    uint8_t buf[FLASH_MEM_BLOCK_SIZE];
+    uint16_t res;
+    uint16_t bytes_sent = 0;
+    uint16_t bytes_remaining = len;
+    uint8_t buf[FLASH_MEM_BLOCK_SIZE] = {0};
+
     while (bytes_remaining > 0) {
 
         Flash_CheckBusy(BUSY_TIMEOUT);
@@ -123,18 +127,19 @@ uint16_t Flash_Write(uint32_t address, uint8_t *in, uint16_t len) {
 
         res = Flash_WriteDataCont(address + bytes_sent, buf, bytes_in_packet);
 
+        // a rejected page stops here, so bytes_sent stays at what really landed
+        if (res != bytes_in_packet) {
+            goto out;
+        }
+
         bytes_remaining -= bytes_in_packet;
         bytes_sent += bytes_in_packet;
-
-        isok = (res == bytes_in_packet);
-
-        if (!isok)
-            goto out;
     }
 
 out:
     FlashStop();
-    return len;
+    // bytes actually programmed, callers compare this against len
+    return bytes_sent;
 }
 
 void Flashmem_print_status(void) {
@@ -161,7 +166,8 @@ void Flashmem_print_status(void) {
                 );
     }
 
-    Dbprintf("  Memory size............. " _YELLOW_("%d Kb") " ( %d pages * 64k )", spi_flash_pages64k * 64, spi_flash_pages64k);
+    char size[SPRINT_BYTES_LEN];
+    Dbprintf("  Memory size............. " _YELLOW_("%s") " ( %d pages * 64 KB )", sprint_bytes(size, spi_flash_pages64k * 64 * 1024), spi_flash_pages64k);
 
     uint8_t uid[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     Flash_UniqueID(uid);

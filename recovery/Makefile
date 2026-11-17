@@ -1,3 +1,15 @@
+
+# This Makefile might have been called directly, not via the root Makefile, so:
+ifeq ($(PLTNAME),)
+    PLATFORM_FILE ?= ../Makefile.platform
+    -include $(PLATFORM_FILE)
+    -include ../.Makefile.options.cache
+    include ../common_arm/Makefile.hal
+    ifeq ($(PLATFORM_CHANGED), true)
+        $(error platform definitions have been changed, please "make clean" at the root of the project)
+    endif
+endif
+
 include ../common_arm/Makefile.common
 
 INSTALLFW = recovery.bin
@@ -29,7 +41,7 @@ ifeq ($(PLATFORM),PM5)
 	$(Q)$(CROSS_OBJCOPY) --gap-fill=0xff --pad-to 0x08004000 -O binary $^ $@
 else
 	$(info [=] GENB $@)
-	$(Q)$(CROSS_OBJCOPY) --gap-fill=0xff --pad-to 0x00104000 -O binary $^ $@
+	$(Q)$(CROSS_OBJCOPY) --gap-fill=0xff --pad-to 0x00102000 -O binary $^ $@
 endif
 
 fullimage.bin: ../armsrc/obj/fullimage.elf

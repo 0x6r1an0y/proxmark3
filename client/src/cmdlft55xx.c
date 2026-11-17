@@ -61,6 +61,8 @@ static bool t55xx_psk3_probe(bool usepwd, uint32_t password, uint8_t downlink_mo
 static uint8_t t55xx_measure_broadcast_blocks(bool usepwd, uint32_t password, uint8_t downlink_mode);
 static uint8_t t55xx_measure_broadcast_blocks_once(bool usepwd, uint32_t password, uint8_t downlink_mode);
 static size_t t55xx_psk3_resolve(uint8_t nblk, uint32_t *only);
+static bool t55xx_block0_rotation_ambiguous(void);
+static bool t55xx_resolve_block0_rotation(uint8_t nblk);
 
 // Default configuration
 static t55xx_conf_block_t config = {
@@ -80,6 +82,13 @@ static t55xx_memory_item_t cardmem[T55x7_BLOCK_COUNT] = {{0}};
 // Regular read mode cycles several blocks and a buffer loaded from a file could be either
 static bool s_block_read_capture = false;
 
+// samples dropped from the head of a capture before psk demodulation
+#define T55XX_PSK_SETTLE_TRIM 160
+
+// non-zero while the capture is trimmed, so an anchor recorded inside the trim
+// still names an untrimmed sample
+static int32_t s_sample_bias = 0;
+
 // A block read repeats one 32 bit word for as long as the field is on.
 // `offset` is a bit index into a demod buffer that no longer exists once the next acquisition lands,
 // and the demodulators do not all start on the same bit:
@@ -88,16 +97,34 @@ static bool s_block_read_capture = false;
 static void t55xx_anchor(t55xx_conf_block_t *c, uint8_t offset) {
     c->offset = offset;
     c->anchor_valid = (g_DemodClock > 0);
-    c->anchor_sample = g_DemodStartIdx + ((int32_t)offset * g_DemodClock);
-    c->anchor_tracelen = (int32_t)g_GraphTraceLen;
+    c->anchor_sample = g_DemodStartIdx + ((int32_t)offset * g_DemodClock) + s_sample_bias;
+    c->anchor_tracelen = (int32_t)g_GraphTraceLen + s_sample_bias;
 }
 
 // records a detect candidate against the demodulation that is loaded right now
 static void t55xx_record_hit(t55xx_conf_block_t *t) {
     t->block0 = PackBits(t->offset, 32, g_DemodBuffer);
     t->anchor_valid = (g_DemodClock > 0);
-    t->anchor_sample = g_DemodStartIdx + ((int32_t)t->offset * g_DemodClock);
-    t->anchor_tracelen = (int32_t)g_GraphTraceLen;
+    t->anchor_sample = g_DemodStartIdx + ((int32_t)t->offset * g_DemodClock) + s_sample_bias;
+    t->anchor_tracelen = (int32_t)g_GraphTraceLen + s_sample_bias;
+}
+
+// skip first 160 samples to allow antenna to settle in (psk gets inverted occasionally otherwise)
+static buffer_savestate_t t55xx_psk_trim_head(void) {
+    buffer_savestate_t st = save_graphbuffer();
+
+    char ltrim[16];
+    snprintf(ltrim, sizeof(ltrim), "-i %d", T55XX_PSK_SETTLE_TRIM);
+    CmdLtrim(ltrim);
+
+    s_sample_bias = T55XX_PSK_SETTLE_TRIM;
+    return st;
+}
+
+static void t55xx_psk_untrim_head(buffer_savestate_t st) {
+    s_sample_bias = 0;
+    restore_graphbuffer(st);
+    free_buffer_savestate(st);
 }
 
 // the bit offset to read a block at in the demod buffer loaded right now
@@ -794,17 +821,22 @@ int T55xxReadBlockEx(uint8_t block, bool page1, bool usepwd, uint8_t override, u
         // override = 1 (override and display)
         // override = 2 (override and no display)
         if (override == 0) {
-            if (AcquireData(T55x7_PAGE0, T55x7_CONFIGURATION_BLOCK, false, 0, downlink_mode) == false)
-                return PM3_ERFTRANS;
+            // A live detect (lf t55xx detect -p) that recovered this password already confirmed the PWD bit is set.
+            bool detect_confirmed_pwd = (config.pwd_known && config.usepwd && config.pwd == password);
 
-            if (t55xxTryDetectModulationEx(downlink_mode, false, 0, password) == false) {
-                PrintAndLogEx(WARNING, "Safety check: Could not detect if PWD bit is set in config block. Exits.");
-                PrintAndLogEx(HINT, "Hint: Consider using the override parameter to force read.");
-                return PM3_EWRONGANSWER;
-            } else {
-                PrintAndLogEx(WARNING, "Safety check: PWD bit is NOT set in config block. Reading without password...");
-                usepwd = false;
-                page1 = false; // ??
+            if (detect_confirmed_pwd == false) {
+                if (AcquireData(T55x7_PAGE0, T55x7_CONFIGURATION_BLOCK, false, 0, downlink_mode) == false)
+                    return PM3_ERFTRANS;
+
+                if (t55xxTryDetectModulationEx(downlink_mode, false, 0, password) == false) {
+                    PrintAndLogEx(WARNING, "Safety check: Could not detect if PWD bit is set in config block. Exits.");
+                    PrintAndLogEx(HINT, "Hint: Consider using the override parameter to force read.");
+                    return PM3_EWRONGANSWER;
+                } else {
+                    PrintAndLogEx(WARNING, "Safety check: PWD bit is NOT set in config block. Reading without password...");
+                    usepwd = false;
+                    page1 = false;
+                }
             }
         } else if (override == 1) {
             PrintAndLogEx(INFO, "Safety check overridden - proceeding despite risk");
@@ -985,7 +1017,7 @@ static void T55xx_Print_DownlinkMode(uint8_t downlink_mode) {
             break;
     }
 
-    PrintAndLogEx(SUCCESS, msg);
+    PrintAndLogEx(SUCCESS, "%s", msg);
 }
 
 static int CmdT55xxWakeUp(const char *Cmd) {
@@ -1059,19 +1091,24 @@ static int CmdT55xxWakeUp(const char *Cmd) {
 static int CmdT55xxDetect(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "lf t55xx detect",
-                  "Try detecting the tag modulation from reading the configuration block",
+                  "Try detecting the tag modulation from reading the configuration block.\n\n"
+                  _RED_("           * * * WARNING * * *") "\n"
+                  _CYAN_("Use of detect with password on a tag not configured") "\n"
+                  _CYAN_("for a password can damage the tag") "\n"
+                  _RED_("           * * * * * * * * * *"),
                   "lf t55xx detect\n"
                   "lf t55xx detect -1\n"
-                  "lf t55xx detect -p 11223344\n"
+                  "lf t55xx detect -p 11223344 -o\n"
                  );
 
-    // 1 (help) + 2 (two user specified params) + (6 T55XX_DLMODE_ALL)
-    void *argtable[3 + 6] = {
+    // 1 (help) + 3 (three user specified params) + (6 T55XX_DLMODE_ALL)
+    void *argtable[4 + 6] = {
         arg_param_begin,
         arg_lit0("1", NULL, "extract using data from graphbuffer"),
         arg_str0("p", "pwd", "<hex>", "password (4 hex bytes)"),
+        arg_lit0("o", "override", "override safety check"),
     };
-    uint8_t idx = 3;
+    uint8_t idx = 4;
     arg_add_t55xx_downloadlink(argtable, &idx, T55XX_DLMODE_ALL, config.downlink_mode);
     CLIExecWithReturn(ctx, Cmd, argtable, true);
 
@@ -1091,16 +1128,26 @@ static int CmdT55xxDetect(const char *Cmd) {
         password = tmp_pwd;
     }
 
-    bool r0 = arg_get_lit(ctx, 3);
-    bool r1 = arg_get_lit(ctx, 4);
-    bool r2 = arg_get_lit(ctx, 5);
-    bool r3 = arg_get_lit(ctx, 6);
-    bool ra = arg_get_lit(ctx, 7);
+    bool override = arg_get_lit(ctx, 3);
+
+    bool r0 = arg_get_lit(ctx, 4);
+    bool r1 = arg_get_lit(ctx, 5);
+    bool r2 = arg_get_lit(ctx, 6);
+    bool r3 = arg_get_lit(ctx, 7);
+    bool ra = arg_get_lit(ctx, 8);
     CLIParserFree(ctx);
 
     if ((r0 + r1 + r2 + r3 + ra) > 1) {
         PrintAndLogEx(FAILED, "Error multiple downlink encoding");
         return PM3_EINVARG;
+    }
+
+    // A password frame on an unprotected tag can land as a write, and detect cannot
+    // check the PWD bit first the way read does -- finding the config is its job.
+    if (usepwd && (override == false)) {
+        PrintAndLogEx(WARNING, "Safety check: Could not confirm PWD bit is set. Detecting without password...");
+        PrintAndLogEx(HINT, "Hint: Consider using the override parameter to force detect with password.");
+        usepwd = false;
     }
 
     bool try_all_dl_modes = false;
@@ -1247,12 +1294,32 @@ static int CmdT55xxDetect(const char *Cmd) {
         }
     }
 
+    // Several rotations of the word can read as a configuration and detect takes the first the
+    // scan reaches.  The broadcast period is the tag's own answer to which is real
+    bool rerotated = false;
+
+    if (found && use_gb == false && t55xx_block0_rotation_ambiguous()) {
+
+        if (nblk == 0) {
+            nblk = t55xx_measure_broadcast_blocks(config.usepwd, config.pwd, config.downlink_mode);
+            config.broadcast_blocks = nblk;
+        }
+
+        if (nblk) {
+            rerotated = t55xx_resolve_block0_rotation(nblk);
+        }
+    }
+
     if (found) {
 
         printConfiguration(config);
 
         if (nblk) {
             PrintAndLogEx(SUCCESS, "Broadcast repeats every " _GREEN_("%u") " block(s), so maxblock is a multiple of %u", nblk, nblk);
+        }
+
+        if (rerotated) {
+            PrintAndLogEx(SUCCESS, "Block 0 " _GREEN_("re-anchored") " - the first reading was a rotation the broadcast period contradicts");
         }
 
         if (psk2_out) {
@@ -1283,6 +1350,9 @@ bool t55xxTryDetectModulation(uint8_t downlink_mode, bool print_config) {
 // every correct detection recovered at least 98.8% of g_GraphTraceLen / clk bits
 #define T55XX_MIN_DEMOD_YIELD_PCT 80
 
+// true while test() checks an ask demodulation that DetectST cut sequence terminators out of
+static bool s_demod_st_cut = false;
+
 static bool t55xx_demod_yield_ok(uint8_t clk) {
 
     // what actually produced the bits, which is not always what was asked for
@@ -1292,7 +1362,13 @@ static bool t55xx_demod_yield_ok(uint8_t clk) {
         return true;
     }
 
-    const size_t expected = g_GraphTraceLen / used;
+    size_t expected = g_GraphTraceLen / used;
+
+    // On a one-block read, DetectST drops the bits before the first terminator (0 to 36), then 4 of every 36.
+    // The expected count leaves out all 36 leading bits, then 4 of every 36.
+    if (s_demod_st_cut && expected > 36) {
+        expected = (expected - 36) * 32 / 36;
+    }
 
     // too short to say anything either way
     if (expected < 32) {
@@ -1334,6 +1410,71 @@ static uint8_t t55xx_observed_psk_carrier(void) {
     return (fc == 2 || fc == 4 || fc == 8) ? (uint8_t)fc : 0;
 }
 
+// Searches for a copy of the word at offset, 33 to 36 bits after it (dir 1) or before it (dir -1).
+// Returns 1 if it finds one, -1 if the search runs off the buffer first, and 0 otherwise.
+// A copy past bit 255 counts as none, because PackBits takes a uint8_t start.
+static int block0_st_copy(uint8_t offset, int dir) {
+
+    const uint32_t word = PackBits(offset, 32, g_DemodBuffer);
+    for (int stride = 33; stride <= 36; stride++) {
+        const int at = offset + (dir * stride);
+        if (at < 0 || (size_t)at + 32 > g_DemodBufferLen) {
+            return -1;
+        }
+        if (at > 255) {
+            return 0;
+        }
+        if (word == PackBits((uint8_t)at, 32, g_DemodBuffer)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Like block0_stride_not_disproved, but a T5577 word with its ST bit set may also repeat 33 to 36 bits on.
+// A terminator adds up to four bit periods between copies of block 0, and fsk demodulates it to about two bits.
+// Only the strict fsk pass calls this.
+static bool block0_stride_not_disproved_st(uint8_t offset, bool q5) {
+
+    if (block0_stride_not_disproved(offset)) {
+        return true;
+    }
+
+    // A Q5 word keeps the 32 bit check. Its ST bit is T5555_ST_TERMINATOR, and no Q5 was measured at the wider stride.
+    if (q5) {
+        return false;
+    }
+
+    const uint32_t word = PackBits(offset, 32, g_DemodBuffer);
+    if ((word & T55x7_ST_TERMINATOR) == 0) {
+        return false;
+    }
+
+    // A copy past the end of the buffer cannot disprove the word, as in block0_stride_not_disproved.
+    return block0_st_copy(offset, 1) != 0;
+}
+
+// fsk has no DetectST. Reports ST if the word has its ST bit set and a copy sits 33 to 36 bits before or after it.
+// test() often picks the second copy, so both sides count. If neither side has room, the ST bit decides. Not on a Q5.
+static bool block0_fsk_st_seen(uint8_t offset, bool q5) {
+
+    if (q5) {
+        return false;
+    }
+
+    const uint32_t word = PackBits(offset, 32, g_DemodBuffer);
+    if ((word & T55x7_ST_TERMINATOR) == 0) {
+        return false;
+    }
+
+    const int ahead = block0_st_copy(offset, 1);
+    const int behind = block0_st_copy(offset, -1);
+    if (ahead == 1 || behind == 1) {
+        return true;
+    }
+    return (ahead == -1 && behind == -1);
+}
+
 static void t55xx_psk_coherent(int fitclk, uint8_t clk, t55xx_conf_block_t *tests, uint8_t *hits, uint8_t downlink_mode) {
 
     static const int subcarriers[] = { 2, 4, 8 };
@@ -1373,7 +1514,7 @@ static void t55xx_psk_coherent(int fitclk, uint8_t clk, t55xx_conf_block_t *test
         double this_clk = 0.0, score = 0.0;
         int this_phase = 0;
 
-        if (pm3_psk_demod(sig, count, subcarriers[s], (double)fitclk, work, &got_n, &this_clk, &this_phase, &score, NULL) != PM3_SUCCESS) {
+        if (pm3_psk_demod(sig, count, subcarriers[s], (double)fitclk, work, &got_n, &this_clk, &this_phase, &score, NULL, NULL) != PM3_SUCCESS) {
             continue;
         }
 
@@ -1503,6 +1644,8 @@ static void t55xx_ask_coherent(int fitclk, uint8_t clk, t55xx_conf_block_t *test
             }
 
             // sweeping the bit rates means a wrong one can fit first, so hold a block read to the 32 bit stride
+            // This detector decodes an ST word with the wrong polarity and no ST, and the 32 bit stride rejects it.
+            // The fallback's ask attempts decode that word correctly. Keep the 32 bit stride here.
             if (s_block_read_capture && block0_stride_not_disproved(tests[*hits].offset) == false) {
                 continue;
             }
@@ -1520,6 +1663,13 @@ static void t55xx_ask_coherent(int fitclk, uint8_t clk, t55xx_conf_block_t *test
     free(sig);
     free(raw);
     free(work);
+}
+
+static bool test_ask(bool st_cut, uint8_t *offset, int *fndBitRate, uint8_t clk, bool *Q5) {
+    s_demod_st_cut = st_cut;
+    const bool ok = test(DEMOD_ASK, offset, fndBitRate, clk, Q5);
+    s_demod_st_cut = false;
+    return ok;
 }
 
 static bool t55xx_fallback_try(pm3_mod_t mod, pm3_enc_t enc, int fc_hi, int fc_lo, int fitclk,
@@ -1567,7 +1717,7 @@ static bool t55xx_fallback_try(pm3_mod_t mod, pm3_enc_t enc, int fc_hi, int fc_l
                             continue;
                         }
 
-                        if (strict && block0_stride_not_disproved(tests[*hits].offset) == false) {
+                        if (strict && block0_stride_not_disproved_st(tests[*hits].offset, tests[*hits].Q5) == false) {
                             continue;
                         }
 
@@ -1582,7 +1732,7 @@ static bool t55xx_fallback_try(pm3_mod_t mod, pm3_enc_t enc, int fc_hi, int fc_l
                         tests[*hits].bitrate = bitRate;
                         tests[*hits].inverted = (inv != 0);
                         t55xx_record_hit(&tests[*hits]);
-                        tests[*hits].ST = false;
+                        tests[*hits].ST = block0_fsk_st_seen(tests[*hits].offset, tests[*hits].Q5);
                         tests[*hits].downlink_mode = downlink_mode;
                         (*hits)++;
                         return true;
@@ -1595,9 +1745,7 @@ static bool t55xx_fallback_try(pm3_mod_t mod, pm3_enc_t enc, int fc_hi, int fc_l
 
     if (mod == PM3_MOD_PSK) {
 
-        buffer_savestate_t saveState = save_bufferS32(g_GraphBuffer, g_GraphTraceLen);
-        saveState.offset = g_GridOffset;
-        CmdLtrim("-i 160");
+        buffer_savestate_t saveState = t55xx_psk_trim_head();
 
         for (int inv = 0; inv < 2; inv++) {
             if (PSKDemod(fitclk, inv, PM3_T55_FALLBACK_MAXERR, false) != PM3_SUCCESS) {
@@ -1631,8 +1779,7 @@ static bool t55xx_fallback_try(pm3_mod_t mod, pm3_enc_t enc, int fc_hi, int fc_l
             }
         }
 
-        restore_bufferS32(saveState, g_GraphBuffer);
-        g_GridOffset = saveState.offset;
+        t55xx_psk_untrim_head(saveState);
 
         if (*hits == before && coherent_ok) {
             t55xx_psk_coherent(fitclk, clk, tests, hits, downlink_mode);
@@ -1665,10 +1812,11 @@ static bool t55xx_fallback_try(pm3_mod_t mod, pm3_enc_t enc, int fc_hi, int fc_l
         return false;
     }
 
-    tests[*hits].ST = true;
-    if ((ASKDemod_ext(fitclk, 0, PM3_T55_FALLBACK_MAXERR, 0, false, false, false, 1, &tests[*hits].ST) == PM3_SUCCESS)
-            && test(DEMOD_ASK, &tests[*hits].offset, &bitRate, clk, &tests[*hits].Q5)) {
+    bool st_cut = false;
+    if ((ASKDemod_ext(fitclk, 0, PM3_T55_FALLBACK_MAXERR, 0, false, false, false, 1, &st_cut) == PM3_SUCCESS)
+            && test_ask(st_cut, &tests[*hits].offset, &bitRate, clk, &tests[*hits].Q5)) {
 
+        tests[*hits].ST = st_cut;
         tests[*hits].modulation = DEMOD_ASK;
         tests[*hits].bitrate = bitRate;
         tests[*hits].inverted = false;
@@ -1678,10 +1826,11 @@ static bool t55xx_fallback_try(pm3_mod_t mod, pm3_enc_t enc, int fc_hi, int fc_l
         return true;
     }
 
-    tests[*hits].ST = true;
-    if ((ASKDemod_ext(fitclk, 1, PM3_T55_FALLBACK_MAXERR, 0, false, false, false, 1, &tests[*hits].ST) == PM3_SUCCESS)
-            && test(DEMOD_ASK, &tests[*hits].offset, &bitRate, clk, &tests[*hits].Q5)) {
+    st_cut = false;
+    if ((ASKDemod_ext(fitclk, 1, PM3_T55_FALLBACK_MAXERR, 0, false, false, false, 1, &st_cut) == PM3_SUCCESS)
+            && test_ask(st_cut, &tests[*hits].offset, &bitRate, clk, &tests[*hits].Q5)) {
 
+        tests[*hits].ST = st_cut;
         tests[*hits].modulation = DEMOD_ASK;
         tests[*hits].bitrate = bitRate;
         tests[*hits].inverted = true;
@@ -1887,7 +2036,7 @@ bool t55xxTryDetectModulationEx(uint8_t downlink_mode, bool print_config, uint32
             tests[hits].bitrate = bitRate;
             tests[hits].inverted = false;
             t55xx_record_hit(&tests[hits]);
-            tests[hits].ST = false;
+            tests[hits].ST = block0_fsk_st_seen(tests[hits].offset, tests[hits].Q5);
             tests[hits].downlink_mode = downlink_mode;
             ++hits;
         }
@@ -1900,20 +2049,21 @@ bool t55xxTryDetectModulationEx(uint8_t downlink_mode, bool print_config, uint32
             tests[hits].bitrate = bitRate;
             tests[hits].inverted = true;
             t55xx_record_hit(&tests[hits]);
-            tests[hits].ST = false;
+            tests[hits].ST = block0_fsk_st_seen(tests[hits].offset, tests[hits].Q5);
             tests[hits].downlink_mode = downlink_mode;
             ++hits;
         }
     } else {
         clk = GetAskClock("", false);
         if (clk > 0) {
-            tests[hits].ST = true;
             // "0 0 1 " == clock auto, invert false, maxError 1.
             // false = no verbose
             // false = no emSearch
             // 1 = Ask/Man
-            // st = true
-            if ((ASKDemod_ext(0, 0, 1, 0, false, false, false, 1, &tests[hits].ST) == PM3_SUCCESS) && test(DEMOD_ASK, &tests[hits].offset, &bitRate, clk, &tests[hits].Q5)) {
+            // st_cut = set if DetectST cut out sequence terminators
+            bool st_cut = false;
+            if ((ASKDemod_ext(0, 0, 1, 0, false, false, false, 1, &st_cut) == PM3_SUCCESS) && test_ask(st_cut, &tests[hits].offset, &bitRate, clk, &tests[hits].Q5)) {
+                tests[hits].ST = st_cut;
                 tests[hits].modulation = DEMOD_ASK;
                 tests[hits].bitrate = bitRate;
                 tests[hits].inverted = false;
@@ -1921,13 +2071,14 @@ bool t55xxTryDetectModulationEx(uint8_t downlink_mode, bool print_config, uint32
                 tests[hits].downlink_mode = downlink_mode;
                 ++hits;
             }
-            tests[hits].ST = true;
             // "0 0 1 " == clock auto, invert true, maxError 1.
             // false = no verbose
             // false = no emSearch
             // 1 = Ask/Man
-            // st = true
-            if ((ASKDemod_ext(0, 1, 1, 0, false, false, false, 1, &tests[hits].ST) == PM3_SUCCESS) && test(DEMOD_ASK, &tests[hits].offset, &bitRate, clk, &tests[hits].Q5)) {
+            // st_cut = set if DetectST cut out sequence terminators
+            st_cut = false;
+            if ((ASKDemod_ext(0, 1, 1, 0, false, false, false, 1, &st_cut) == PM3_SUCCESS) && test_ask(st_cut, &tests[hits].offset, &bitRate, clk, &tests[hits].Q5)) {
+                tests[hits].ST = st_cut;
                 tests[hits].modulation = DEMOD_ASK;
                 tests[hits].bitrate = bitRate;
                 tests[hits].inverted = true;
@@ -1980,10 +2131,7 @@ bool t55xxTryDetectModulationEx(uint8_t downlink_mode, bool print_config, uint32
         clk = GetPskClock("", false);
         if (clk > 0) {
             // allow undo
-            buffer_savestate_t saveState = save_bufferS32(g_GraphBuffer, g_GraphTraceLen);
-            saveState.offset = g_GridOffset;
-            // skip first 160 samples to allow antenna to settle in (psk gets inverted occasionally otherwise)
-            CmdLtrim("-i 160");
+            buffer_savestate_t saveState = t55xx_psk_trim_head();
             if ((PSKDemod(0, 0, 6, false) == PM3_SUCCESS) && test(DEMOD_PSK1, &tests[hits].offset, &bitRate, clk, &tests[hits].Q5)) {
                 tests[hits].modulation = DEMOD_PSK1;
                 tests[hits].bitrate = bitRate;
@@ -2019,8 +2167,7 @@ bool t55xxTryDetectModulationEx(uint8_t downlink_mode, bool print_config, uint32
             } // inverse waves does not affect this demod
 
             //undo trim samples
-            restore_bufferS32(saveState, g_GraphBuffer);
-            g_GridOffset = saveState.offset;
+            t55xx_psk_untrim_head(saveState);
             // t55xx_search_config_psk(g_GraphBuffer, 1);
             // t55xx_search_config_psk(g_GraphBuffer, 2);
         }
@@ -2130,6 +2277,8 @@ bool testKnownConfigBlock(uint32_t block0) {
         case T55X7_NEDAP_128_CONFIG_BLOCK:
         case T55X7_VISA2000_CONFIG_BLOCK:
         case T55X7_SECURAKEY_CONFIG_BLOCK:
+        case T55X7_SECURAKEY_SHORT_CONFIG_BLOCK:
+        case T55X7_ICT_CONFIG_BLOCK:
         case T55X7_PAC_CONFIG_BLOCK:
         case T55X7_VERICHIP_CONFIG_BLOCK:
         case T55X7_KERI_CONFIG_BLOCK:
@@ -2565,6 +2714,167 @@ static void windows_build(t55_windows_t *w) {
     }
 }
 
+// the checks a 32 bit word has to pass to be a configuration block for `mode` at
+// `clk`, independent of where in a demodulation it was found
+static bool t55xx_block0_plausible(uint32_t block0, uint8_t mode, uint8_t clk, int *fndBitRate) {
+
+    uint8_t safer    = (block0 >> 28) & 0x0F;   //master key
+    uint8_t resv     = (block0 >> 24) & 0x0F;   //was 7 // should be only 4 bits if extended mode
+    // 2nibble must be zeroed.
+
+    if (resv > 0x00) {
+        return false;
+    }
+
+    // The master key is 0, or 6 or 9 to select extended mode
+    if (safer != 0x0 && safer != 0x6 && safer != 0x9) {
+        return false;
+    }
+
+    int bitRate      = (block0 >> 18) & 0x3F;   //bit rate (includes extended mode part of rate)
+    uint8_t extend   = (block0 >> 17) & 0x01;   //bit 15 extended mode
+    uint8_t modread  = (block0 >> 12) & 0x1F;
+    //pskcr  = (block0 >> 10) & 0x03;  //could check psk cr
+    //bit 24, 30, 31 are otp, fast write and inverse data - all settable, so no help here
+
+    // Bit 14 selects extended mode, and extended mode only exists under master key 6 or 9.
+    // Set with any other key the word is not a valid configuration
+    if (extend && safer != 0x6 && safer != 0x9) {
+        return false;
+    }
+
+    //if extended mode
+    bool extMode = ((safer == 0x6 || safer == 0x9) && extend) ? true : false;
+
+    if (extMode == false) {
+
+        if (bitRate > 7) {
+            return false;
+        }
+
+        if (testBitRate(bitRate, clk) == false) {
+            return false;
+        }
+
+    } else { //extended mode bitrate = same function to calc bitrate as em4x05
+        if (EM4x05_GET_BITRATE(bitRate) != clk) {
+            return false;
+        }
+    }
+
+    //test modulation
+    if (testModulation(mode, modread) == false) {
+        return false;
+    }
+
+    if (fndBitRate) {
+        *fndBitRate = bitRate;
+    }
+    return true;
+}
+
+// true when the maxblock and sequence terminator in `block0` could have produced
+// an `nblk` block broadcast period
+static bool t55xx_block0_fits_period(uint32_t block0, uint8_t nblk) {
+
+    // ST adds four bit periods per cycle, so a whole number of 32
+    // bit blocks rules it out.  leans on the measurement, not on
+    // config.ST, which the psk paths hardcode rather than detect
+    if (((block0 >> 3) & 1) != 0) {
+        return false;
+    }
+
+    const uint8_t mb = (block0 >> 5) & 0x07;
+    return (mb != 0 && (mb % nblk) == 0);
+}
+
+// how many distinct rotations of `block0` read as a configuration for `mode` at `clk`.  more than
+// one means detect's answer was scan order, not evidence.  `nblk` 0 skips the period constraint
+static size_t t55xx_block0_rotations(uint32_t block0, uint8_t mode, uint8_t clk, uint8_t nblk, uint32_t *only) {
+
+    uint32_t seen[32] = {0};
+    size_t n = 0;
+
+    for (uint8_t r = 0; r < 32; r++) {
+
+        const uint32_t v = (r == 0) ? block0 : ((block0 << r) | (block0 >> (32 - r)));
+
+        if (t55xx_block0_plausible(v, mode, clk, NULL) == false) {
+            continue;
+        }
+
+        if (nblk != 0 && t55xx_block0_fits_period(v, nblk) == false) {
+            continue;
+        }
+
+        // a word that is its own rotation offers the same value twice
+        bool dup = false;
+        for (size_t i = 0; i < n; i++) {
+            if (seen[i] == v) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+
+        seen[n++] = v;
+    }
+
+    if (n == 1 && only != NULL) {
+        *only = seen[0];
+    }
+    return n;
+}
+
+// the clock the detected bit rate names, for the rotation helpers above
+static uint8_t t55xx_config_clock(void) {
+    static const uint8_t basic[] = {8, 16, 32, 40, 50, 64, 100, 128};
+    return basic[config.bitrate & 0x07];
+}
+
+// more than one rotation of the detected block 0 reads as a configuration
+static bool t55xx_block0_rotation_ambiguous(void) {
+
+    if (config.Q5 || config.block0 == 0) {
+        return false;
+    }
+
+    return (t55xx_block0_rotations(config.block0, config.modulation, t55xx_config_clock(), 0, NULL) > 1);
+}
+
+// Settle which rotation is real with the tag's own broadcast period and re-anchor on it.  Nothing
+// surviving means the measurement disagrees with every reading, so leave the detected word alone
+static bool t55xx_resolve_block0_rotation(uint8_t nblk) {
+
+    uint32_t only = 0;
+    if (t55xx_block0_rotations(config.block0, config.modulation, t55xx_config_clock(), nblk, &only) != 1) {
+        return false;
+    }
+
+    if (only == config.block0) {
+        return false;
+    }
+
+    // measuring the period left a regular read in the demod buffer
+    if (AcquireData(T55x7_PAGE0, T55x7_CONFIGURATION_BLOCK, config.usepwd, config.pwd, config.downlink_mode) == false) {
+        return false;
+    }
+
+    if (DecodeT55xxBlock() == false) {
+        return false;
+    }
+
+    if (t55xx_stream_holds(only) == false) {
+        return false;
+    }
+
+    // keep the offset t55xx_stream_holds just anchored
+    SetConfigWithBlock0Ex(only, config.offset, config.Q5);
+    return true;
+}
+
 static bool test_scan(uint8_t mode, uint8_t *offset, int *fndBitRate, uint8_t clk,
                       uint16_t start, uint16_t end, const t55_windows_t *w,
                       uint16_t need, bool need_stride) {
@@ -2581,58 +2891,8 @@ static bool test_scan(uint8_t mode, uint8_t *offset, int *fndBitRate, uint8_t cl
             continue;
         }
 
-        uint8_t safer    = PackBits(si, 4, g_DemodBuffer);
-        si += 4;     //master key
-        uint8_t resv     = PackBits(si, 4, g_DemodBuffer);
-        si += 4;     //was 7 & +=7+3 // should be only 4 bits if extended mode
-        // 2nibble must be zeroed.
-
-        if (resv > 0x00) {
-            continue;
-        }
-
-        // The master key is 0, or 6 or 9 to select extended mode
-        if (safer != 0x0 && safer != 0x6 && safer != 0x9) {
-            continue;
-        }
-
-        int bitRate      = PackBits(si, 6, g_DemodBuffer);
-        si += 6;     //bit rate (includes extended mode part of rate)
-        uint8_t extend   = PackBits(si, 1, g_DemodBuffer);
-        si += 1;     //bit 15 extended mode
-        uint8_t modread  = PackBits(si, 5, g_DemodBuffer);
-        si += 5 + 2 + 1;
-        //uint8_t pskcr   = PackBits(si, 2, g_DemodBuffer); si += 2+1;  //could check psk cr
-        //uint8_t nml01    = PackBits(si, 1, g_DemodBuffer); si += 1+5;   //bit 24, 30, 31 could be tested for 0 if not extended mode
-        //uint8_t nml02    = PackBits(si, 2, g_DemodBuffer); si += 2;
-
-        // Bit 14 selects extended mode, and extended mode only exists under master key 6 or 9.
-        // Set with any other key the word is not a valid configuration
-        if (extend && safer != 0x6 && safer != 0x9) {
-            continue;
-        }
-
-        //if extended mode
-        bool extMode = ((safer == 0x6 || safer == 0x9) && extend) ? true : false;
-
-        if (extMode == false) {
-
-            if (bitRate > 7) {
-                continue;
-            }
-
-            if (testBitRate(bitRate, clk) == false) {
-                continue;
-            }
-
-        } else { //extended mode bitrate = same function to calc bitrate as em4x05
-            if (EM4x05_GET_BITRATE(bitRate) != clk) {
-                continue;
-            }
-        }
-
-        //test modulation
-        if (testModulation(mode, modread) == false) {
+        int bitRate = 0;
+        if (t55xx_block0_plausible(PackBits(si, 32, g_DemodBuffer), mode, clk, &bitRate) == false) {
             continue;
         }
 
@@ -2910,14 +3170,7 @@ int printConfiguration(t55xx_conf_block_t b) {
         if (b.broadcast_blocks) {
             size_t kept = 0;
             for (size_t i = 0; i < ncand; i++) {
-                const uint8_t mb = (cand[i] >> 5) & 0x07;
-                // ST adds four bit periods per cycle, so a whole number of 32
-                // bit blocks rules it out.  leans on the measurement, not on
-                // config.ST, which the psk paths hardcode rather than detect
-                if (((cand[i] >> 3) & 1) != 0) {
-                    continue;
-                }
-                if (mb != 0 && (mb % b.broadcast_blocks) == 0) {
+                if (t55xx_block0_fits_period(cand[i], b.broadcast_blocks)) {
                     cand[kept++] = cand[i];
                 }
             }
@@ -3377,7 +3630,7 @@ void printT5555Trace(t5555_tracedata_t data, uint8_t repeat) {
 
 static void printT5x7KnownBlock0(uint32_t b0) {
 
-    char s[40];
+    char s[80];
     memset(s, 0, sizeof(s));
 
     switch (b0) {
@@ -3395,10 +3648,13 @@ static void printT5x7KnownBlock0(uint32_t b0) {
             snprintf(s + strlen(s), sizeof(s) - strlen(s), "FDXB ");
             break;
         case T55X7_HID_26_CONFIG_BLOCK:
-            snprintf(s + strlen(s), sizeof(s) - strlen(s), "HID 26b (ProxCard), Paradox, AWID ");
+            snprintf(s + strlen(s), sizeof(s) - strlen(s), "HID 26b (ProxCard), Paradox, AWID, WatchNET ");
             break;
         case T55X7_PYRAMID_CONFIG_BLOCK:
-            snprintf(s + strlen(s), sizeof(s) - strlen(s), "Pyramid ");
+            snprintf(s + strlen(s), sizeof(s) - strlen(s), "Pyramid, Keri NXT ");
+            break;
+        case T55X7_ICT_CONFIG_BLOCK:
+            snprintf(s + strlen(s), sizeof(s) - strlen(s), "ICT ");
             break;
         case T55X7_INDALA_64_CONFIG_BLOCK:
             snprintf(s + strlen(s), sizeof(s) - strlen(s), "Indala 64, Motorola, Idteck");
@@ -3444,6 +3700,9 @@ static void printT5x7KnownBlock0(uint32_t b0) {
             break;
         case T55X7_SECURAKEY_CONFIG_BLOCK:
             snprintf(s + strlen(s), sizeof(s) - strlen(s), "SecuraKey ");
+            break;
+        case T55X7_SECURAKEY_SHORT_CONFIG_BLOCK:
+            snprintf(s + strlen(s), sizeof(s) - strlen(s), "SecuraKey Short ");
             break;
         case T55X7_NEXWATCH_CONFIG_BLOCK:
             snprintf(s + strlen(s), sizeof(s) - strlen(s), "NexWatch, Quadrakey ");
@@ -3899,7 +4158,6 @@ static int CmdT55xxRestore(const char *Cmd) {
         }
     } else {
         PrintAndLogEx(WARNING, "Warning: the dump file contains a all zero config block.");
-        PrintAndLogEx(HINT, "Make sure you dumped the card correct");
     }
     free(dump);
     PrintAndLogEx(INFO, "Done!");
@@ -4957,13 +5215,37 @@ out:
     return PM3_SUCCESS;
 }
 
-// note length of data returned is different for different chips.
-// some return all page 1 (64 bits) and others return just that block (32 bits)
-// unfortunately the 64 bits makes this more likely to get a false positive...
-bool tryDetectP1(bool getData) {
-    uint8_t preamble_atmel[] = {1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1};
+// Page-1 trace data opens with allocation class ACL = 0xE0, then a manufacturer code.
+// Genuine Atmel silicon carries manufacturer 0x15 / 0x39 (the atmel / silicon preambles).
+// Cloned T5577s keep the 0xE0 ACL but use another manufacturer byte,
+// also accept a bare 8-bit ACL match
+static bool t55xx_trace_preamble_match(void) {
+    uint8_t preamble_atmel[]   = {1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1};
     uint8_t preamble_silicon[] = {1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1};
+    uint8_t preamble_acl[]     = {1, 1, 1, 0, 0, 0, 0, 0};
     size_t startIdx = 0;
+
+    if (preambleSearchEx(g_DemodBuffer, preamble_atmel, sizeof(preamble_atmel), &g_DemodBufferLen, &startIdx, false) &&
+            (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+        return true;
+    }
+
+    startIdx = 0;
+    if (preambleSearchEx(g_DemodBuffer, preamble_silicon, sizeof(preamble_silicon), &g_DemodBufferLen, &startIdx, false) &&
+            (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+        return true;
+    }
+
+    startIdx = 0;
+    if (preambleSearchEx(g_DemodBuffer, preamble_acl, sizeof(preamble_acl), &g_DemodBufferLen, &startIdx, false) &&
+            (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+        return true;
+    }
+
+    return false;
+}
+
+bool tryDetectP1(bool getData) {
     uint8_t fc1 = 0, fc2 = 0, ans = 0;
     int clk = 0, firstClockEdge = 0;
     bool st = true;
@@ -4973,30 +5255,18 @@ bool tryDetectP1(bool getData) {
             return false;
     }
 
-    // try fsk clock detect. if successful it cannot be any other type of modulation...  (in theory...)
+    // try fsk clock detect. if successful it cannot be any other type of modulation.
     ans = fskClocks(&fc1, &fc2, (uint8_t *)&clk, &firstClockEdge);
     if (ans && ((fc1 == 10 && fc2 == 8) || (fc1 == 8 && fc2 == 5))) {
 
         if (FSKrawDemod(0, 0, 0, 0, false) == PM3_SUCCESS) {
-            if (preambleSearchEx(g_DemodBuffer, preamble_atmel, sizeof(preamble_atmel), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
-                return true;
-            }
-
-            if (preambleSearchEx(g_DemodBuffer, preamble_silicon, sizeof(preamble_silicon), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+            if (t55xx_trace_preamble_match()) {
                 return true;
             }
         }
 
         if (FSKrawDemod(0, 1, 0, 0, false) == PM3_SUCCESS) {
-            if (preambleSearchEx(g_DemodBuffer, preamble_atmel, sizeof(preamble_atmel), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
-                return true;
-            }
-
-            if (preambleSearchEx(g_DemodBuffer, preamble_silicon, sizeof(preamble_silicon), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+            if (t55xx_trace_preamble_match()) {
                 return true;
             }
         }
@@ -5008,113 +5278,60 @@ bool tryDetectP1(bool getData) {
     if (clk > 0) {
         if (ASKDemod_ext(0, 0, 1, 0, false, false, false, 1, &st) == PM3_SUCCESS) {
 
-            if (preambleSearchEx(g_DemodBuffer, preamble_atmel, sizeof(preamble_atmel), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
-                return true;
-            }
-
-            if (preambleSearchEx(g_DemodBuffer, preamble_silicon, sizeof(preamble_silicon), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+            if (t55xx_trace_preamble_match()) {
                 return true;
             }
         }
 
         st = true;
         if (ASKDemod_ext(0, 1, 1, 0, false, false, false, 1, &st) == PM3_SUCCESS) {
-            if (preambleSearchEx(g_DemodBuffer, preamble_atmel, sizeof(preamble_atmel), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
-                return true;
-            }
-
-            if (preambleSearchEx(g_DemodBuffer, preamble_silicon, sizeof(preamble_silicon), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+            if (t55xx_trace_preamble_match()) {
                 return true;
             }
         }
 
         if (ASKbiphaseDemod(0, 0, 0, 2, false) == PM3_SUCCESS) {
-            if (preambleSearchEx(g_DemodBuffer, preamble_atmel, sizeof(preamble_atmel), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
-                return true;
-            }
-
-            if (preambleSearchEx(g_DemodBuffer, preamble_silicon, sizeof(preamble_silicon), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+            if (t55xx_trace_preamble_match()) {
                 return true;
             }
         }
 
         if (ASKbiphaseDemod(0, 0, 1, 2, false) == PM3_SUCCESS) {
-            if (preambleSearchEx(g_DemodBuffer, preamble_atmel, sizeof(preamble_atmel), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
-                return true;
-            }
-
-            if (preambleSearchEx(g_DemodBuffer, preamble_silicon, sizeof(preamble_silicon), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+            if (t55xx_trace_preamble_match()) {
                 return true;
             }
         }
     }
 
     // try NRZ clock detect.  it could be another type even if successful.
-    clk = GetNrzClock("", false); //has the most false positives :(
+    clk = GetNrzClock("", false); // has the most false positives
     if (clk > 0) {
         if (NRZrawDemod(0, 0, 1, false) == PM3_SUCCESS) {
-            if (preambleSearchEx(g_DemodBuffer, preamble_atmel, sizeof(preamble_atmel), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
-                return true;
-            }
-
-            if (preambleSearchEx(g_DemodBuffer, preamble_silicon, sizeof(preamble_silicon), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+            if (t55xx_trace_preamble_match()) {
                 return true;
             }
         }
 
         if (NRZrawDemod(0, 1, 1, false) == PM3_SUCCESS) {
-            if (preambleSearchEx(g_DemodBuffer, preamble_atmel, sizeof(preamble_atmel), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
-                return true;
-            }
-
-            if (preambleSearchEx(g_DemodBuffer, preamble_silicon, sizeof(preamble_silicon), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+            if (t55xx_trace_preamble_match()) {
                 return true;
             }
         }
     }
 
     // Fewer card uses PSK
-    // try psk clock detect. if successful it cannot be any other type of modulation... (in theory...)
+    // try psk clock detect. if successful it cannot be any other type of modulation.
     clk = GetPskClock("", false);
     if (clk > 0) {
-        // allow undo
-        // save_restoreGB(GRAPH_SAVE);
-        // skip first 160 samples to allow antenna to settle in (psk gets inverted occasionally otherwise)
-        //CmdLtrim("-i 160");
-        if (PSKDemod(0, 0, 6, false) == PM3_SUCCESS) {
-            //save_restoreGB(GRAPH_RESTORE);
-            if (preambleSearchEx(g_DemodBuffer, preamble_atmel, sizeof(preamble_atmel), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
-                return true;
-            }
 
-            if (preambleSearchEx(g_DemodBuffer, preamble_silicon, sizeof(preamble_silicon), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+        if (PSKDemod(0, 0, 6, false) == PM3_SUCCESS) {
+            if (t55xx_trace_preamble_match()) {
                 return true;
             }
         }
 
         if (PSKDemod(0, 1, 6, false) == PM3_SUCCESS) {
-            //save_restoreGB(GRAPH_RESTORE);
-            if (preambleSearchEx(g_DemodBuffer, preamble_atmel, sizeof(preamble_atmel), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
-                return true;
-            }
-
-            if (preambleSearchEx(g_DemodBuffer, preamble_silicon, sizeof(preamble_silicon), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+            if (t55xx_trace_preamble_match()) {
                 return true;
             }
         }
@@ -5123,19 +5340,11 @@ bool tryDetectP1(bool getData) {
         if (PSKDemod(0, 0, 6, false) == PM3_SUCCESS) {
             psk1TOpsk2(g_DemodBuffer, g_DemodBufferLen);
 
-            //save_restoreGB(GRAPH_RESTORE);
-            if (preambleSearchEx(g_DemodBuffer, preamble_atmel, sizeof(preamble_atmel), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
-                return true;
-            }
-
-            if (preambleSearchEx(g_DemodBuffer, preamble_silicon, sizeof(preamble_silicon), &g_DemodBufferLen, &startIdx, false) &&
-                    (g_DemodBufferLen == 32 || g_DemodBufferLen == 64)) {
+            if (t55xx_trace_preamble_match()) {
                 return true;
             }
         } // inverse waves does not affect PSK2 demod
-        //undo trim samples
-        //save_restoreGB(GRAPH_RESTORE);
+
         // no other modulation clocks = 2 or 4 so quit searching
         if (fc1 != 8) {
             return false;

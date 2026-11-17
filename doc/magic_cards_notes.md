@@ -1069,7 +1069,7 @@ Possible tag wakeup mechanisms are:
   * Write hidden block: `A8xx+crc`, `[16 bytes data]+crc`
   * Read configuration: `E000+crc`
   * Write configuration: `E100+crc`; `[16 bytes data]+crc`
-  * **Note:** Magic Auth capabilities vary between USCUID implementations. Some variants accept `E0/E1` configuration access but reject `38/A8` hidden-block access unless a Gen1a or GDM magic wakeup backdoor is enabled.
+  * **Note:** Magic Auth capabilities vary between USCUID implementations. Some variants accept `E0/E1` configuration access via Magic Auth but require Gen1a or GDM magic wakeup for `38/A8` hidden-block access.
 
 * **DANGER**
   * Set main memory and config to 00 `F000+crc`
@@ -1172,7 +1172,7 @@ Sectors 2-15
 | `gdmgethidblk` | Read hidden block |
 | `gdmsethidblk` | Write a hidden block |
 | `gdmsetuid` | Set 4-byte / 7-byte UID, or F3 perso (`--f3d`) |
-| `gdmwipe` | Restore card to factory defaults (`-a` for 4K) |
+| `gdmwipe` | Wipe to a known clean 4-byte template (`-a` for 4K) |
 | `gdmsetsig` | Write EV1 signature (hidden blocks 5/6), enable sigsec, write default signature key sector |
 
 ### libnfc commands
@@ -1701,6 +1701,39 @@ CF <passwd> CE <1b block number>                 // Backdoor read 16b block
 CF <passwd> FE <4b new_password>                 // Change password
 ```
 
+UID write without the Gen4 backdoor, all frames raw ISO14443-A with CRC, in one field session
+after a normal anticollision + select:
+
+```
+30 F3          // knock, 5 commands
+30 2A
+30 BD
+30 EF
+30 01
+30 <uid[0]>    // new UID, one byte per command
+30 <uid[1]>    // always 7 commands, zero padded for a 4b UID
+...
+50 00          // HLTA, commits the write
+```
+
+Every command is answered with 16 bytes plus CRC: status byte, the echoed argument, the CRC of
+the command frame the reader sent, then 12 bytes constant for the session. Status is `11` while
+accepting commands and `22` on the halt.
+
+```
+Rdr |30 5D 62 21|
+Tag |11 5D 62 21 6000720F 8CB1A65B E3553815|+crc
+Rdr |50 00 57 CD|
+Tag |22 00 57 CD 6000720F 8CB1A65B E3553815|+crc
+```
+
+The halt is the commit. A compliant tag stays silent on HLTA, this one answers, and without it
+the card discards everything above when the field drops. Afterwards the card is busy writing:
+the next WUPA gets no answer and the one after that returns the new UID, so allow ~150ms and
+more than one activation attempt.
+
+The UID length can't be changed, the parts are physically 4b or 7b.
+
 ### MIFARE Classic Super Furui
 
 ^[Top](#top)
@@ -1766,6 +1799,9 @@ hf mf info
 ...
 
 [usb] pm3 --> hf mf supercard --furui
+...
+
+[usb] pm3 --> hf mf supercard -u 11223344
 ...
 ```
 
@@ -2688,9 +2724,100 @@ More commands to follow. Be careful with some.
 
 ^[Top](#top)
 
+Three kinds of UID changeable ISO15693 tags are known, called V1 (Gen1), V2 (Gen2) and V3 (Gen3) here.
+`hf 15 info` only matches the UID prefix against its vendor list, so it can't tell them apart from genuine tags.
+
 ### Identify
 
-**TODO**
+^[Top](#top)
+
+| Kind | Blocks on tags tested | Set UID with |
+|------|-----------------------|--------------|
+| V1 (Gen1) | 28/40/56 | `hf 15 csetuid` |
+| V2 (Gen2) | 64 | `hf 15 csetuid --v2` |
+| V3 (Gen3) | 80 | `hf 15 csetuid --v3`, then `hf 15 cfinalize` |
+
+The block counts come from the few tags tested, they are only a hint.
+
+The same kind of magic can behave a bit differently between manufacturers, for example the block layout,
+or how the V1 backdoor blocks answer to read and write commands. What is described here comes from the tags tested.
+
+V1: no reliable way to identify it, the only sure check is to set a UID and see if it changes.
+On the V1 tags tested, reading blocks `0x38`, `0x39`, `0x3E` and `0x3F` fails while writing `0x38` and `0x39` works. That may be a hint but it is not confirmed. 
+
+```
+hf 15 raw -ac -d 022038     # command failed on the V1 tags tested
+```
+
+V2: no passive identification known. It uses the custom command `0xE0`, which genuine tags do not implement.
+
+V3: blocks `0x14` and `0x15` hold a signature while the tag is not finalized.
+
+```
+hf 15 raw -ac -d 022014     # A5 2B 44 2C
+hf 15 raw -ac -d 022015     # 21 AE 93 00 (00 00 00 00 after finalize)
+```
+
+
+
+### V1 (Gen1)
+
+^[Top](#top)
+
+The UID is written to blocks `0x38` and `0x39` with plain `WRITEBLOCK`, each holding four UID bytes in reverse order.
+Blocks `0x3E` and `0x3F` are written first as an unlock, this is what `hf 15 csetuid` sends for `E011223344556677`:
+
+```
+hf 15 raw -acw -d 02213E00000000
+hf 15 raw -acw -d 02213F69960000
+hf 15 raw -acw -d 02213877665544
+hf 15 raw -acw -d 022139332211E0
+```
+
+On the tags tested, writing only `0x38` and `0x39` is enough, the new UID is active immediately.
+`0x3E` and `0x3F` accept the unlock values once, later writes fail with `command failed`.
+
+### V2 (Gen2)
+
+^[Top](#top)
+
+Uses the custom command `0xE0`, this is what `hf 15 csetuid --v2` sends for `E011223344556677`:
+
+```
+hf 15 raw -acw -d 02E009473F038B00
+hf 15 raw -acw -d 02E0095200000000
+hf 15 raw -acw -d 02E0094077665544
+hf 15 raw -acw -d 02E00941332211E0
+```
+
+On the V2 tag tested, block `0x38` reads as normal memory, a `WRITEBLOCK` to it is refused with error code 3 (option not supported) unless the request flags carry the option flag (`42` instead of `02`).
+
+### V3 (Gen3)
+
+^[Top](#top)
+
+The UID sits in blocks `0x10` (last four bytes, reversed) and `0x11` (first four bytes, reversed).
+It can be rewritten as often as needed until the tag is finalized:
+
+```
+hf 15 raw -acw -d 02211077665544
+hf 15 raw -acw -d 022111332211E0
+```
+
+Finalize locks the UID for good and can't be undone. It clears the configuration
+blocks and changes the block numbering: on the tag tested, data written to block
+`0x38` before finalize read back at block `0x20` afterwards, a shift of `0x18`.
+User data is moved, not erased. Note down what is where before finalizing:
+
+```
+hf 15 raw -acw -d 022114A52B442C
+hf 15 raw -acw -d 02211569E25D00
+```
+
+> [!WARNING]
+> Writing anything other than these two finalize values to blocks `0x14` and `0x15` bricks the tag.
+>
+> `hf 15 wipe` may brick v3 tag.
 
 ### Proxmark3 commands
 
@@ -2699,8 +2826,19 @@ More commands to follow. Be careful with some.
 Always set a UID starting with `E0`.
 
 ```
-hf 15 csetuid E011223344556677
+hf 15 csetuid -u E011223344556677           # V1
+hf 15 csetuid -u E011223344556677 --v2      # V2
+hf 15 csetuid -u E011223344556677 --v3      # V3
+hf 15 cfinalize -y                          # V3, irreversible
 ```
+
+Before writing, `csetuid` checks that the tag looks like the selected kind:
+
+* V1 reads blocks `0x38`, `0x39`, `0x3E`, `0x3F` and stops if one holds data other than `00000000` (or `69960000` in `0x3F`),
+  or if a read fails other than with no answer / block not available.
+  If the write or the UID check fails and the tag still shows its original UID, it writes those four blocks back to `00000000`.
+* V3 stops unless blocks `0x14` and `0x15` still hold the un-finalized signature, `cfinalize` does the same.
+* V2 has no check, the `0xE0` command is ignored by genuine tags.
 
 or (ignore errors):
 

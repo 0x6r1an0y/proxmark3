@@ -47,6 +47,7 @@
 #include "cmdlfhitag.h"     // for hitag menu
 #include "cmdlfhitaghts.h"  // for hitag S sub commands
 #include "cmdlfhitagu.h"    // for hitag µ sub commands
+#include "cmdlfict.h"       // for ICT menu
 #include "cmdlfidteck.h"    // for idteck menu
 #include "cmdlfio.h"        // for ioprox menu
 #include "cmdlfcotag.h"     // for COTAG menu
@@ -73,6 +74,7 @@
 #include "cmdlftrovan.h"    // for trovan menu
 #include "cmdlfviking.h"    // for viking menu
 #include "cmdlfvisa2000.h"  // for VISA2000 menu
+#include "cmdlfwatchnet.h"  // for WatchNET menu
 #include "cmdlfzx8211.h"    // for ZX8211 menu
 #include "crc.h"
 #include "pm3_cmd.h"        // for LF_CMDREAD_MAX_EXTRA_SYMBOLS
@@ -808,6 +810,7 @@ static int lf_read_internal(bool realtime, bool verbose, uint64_t samples, bool 
 
         size_t sample_bytes = samples * bits_per_sample;
         sample_bytes = (sample_bytes / 8) + (sample_bytes % 8 != 0);
+        const size_t expected_bytes = sample_bytes;
 
         // In real-time mode, the LF bitstream should be loaded before receiving raw data.
         // Otherwise, the first batch of raw data might contain the response of CMD_WTX.
@@ -831,12 +834,25 @@ static int lf_read_internal(bool realtime, bool verbose, uint64_t samples, bool 
             sample_bytes = WaitForRawDataTimeout(realtimeBuf, sample_bytes, 1000, true, false);
         }
         samples = sample_bytes * 8 / bits_per_sample;
-        PrintAndLogEx(INFO, "Done: %" PRIu64 " samples (%zu bytes)", samples, sample_bytes);
+        // the inline "Received x / y bytes" counter already says the transfer is
+        // done, so only repeat it in samples when asked
+        if (verbose) {
+            PrintAndLogEx(INFO, "Done: %" PRIu64 " samples (%zu bytes)", samples, sample_bytes);
+        }
         if (samples != 0) {
             getSamplesFromBufEx(realtimeBuf, samples, bits_per_sample, verbose);
         }
 
         free(realtimeBuf);
+
+        if (sample_bytes < expected_bytes) {
+            // keep what did arrive, but don't let it look like a complete read
+            PrintAndLogEx(WARNING, "transfer stopped early, got " _YELLOW_("%zu") " of " _YELLOW_("%zu") " bytes"
+                          , sample_bytes
+                          , expected_bytes
+                         );
+            return PM3_ETIMEOUT;
+        }
     } else {
         SendCommandNG(CMD_LF_ACQ_RAW_ADC, (uint8_t *)&payload, sizeof(payload));
         PacketResponseNG resp;
@@ -891,6 +907,13 @@ int CmdLFRead(const char *Cmd) {
     bool cm = arg_get_lit(ctx, 3);
     CLIParserFree(ctx);
 
+    // anything past the graph buffer is streamed and then thrown away by
+    // getSamplesFromBufEx(), so don't spend the transfer time on it
+    if (samples > MAX_GRAPH_TRACE_LEN) {
+        PrintAndLogEx(INFO, "Capping to " _YELLOW_("%d") " samples, the graph buffer size", MAX_GRAPH_TRACE_LEN);
+        samples = MAX_GRAPH_TRACE_LEN;
+    }
+
     // it should be the result of BigBuf_max_traceLen(),
     // but IDK how to get it.
     bool realtime = samples >= g_pm3_capabilities.bigbuf_size;
@@ -906,7 +929,9 @@ int CmdLFRead(const char *Cmd) {
         ret = lf_read_internal(realtime, verbose, samples, false);
     } while (cm && (kbd_enter_pressed() == false));
 
-    if (ret == PM3_SUCCESS) {
+    // a truncated transfer still leaves usable samples in the graph buffer,
+    // so report them. lf_read_internal() has already said it was short.
+    if (ret == PM3_SUCCESS || ret == PM3_ETIMEOUT) {
         PrintAndLogEx(SUCCESS, "Got " _YELLOW_("%zu") " samples", g_GraphTraceLen);
 
         if (getSignalProperties()->isnoise) {
@@ -943,6 +968,7 @@ int lf_sniff(bool realtime, bool verbose, uint64_t samples) {
 
         size_t sample_bytes = samples * bits_per_sample;
         sample_bytes = (sample_bytes / 8) + (sample_bytes % 8 != 0);
+        const size_t expected_bytes = sample_bytes;
 
         // In real-time mode, the LF bitstream should be loaded before receiving raw data.
         // Otherwise, the first batch of raw data might contain the response of CMD_WTX.
@@ -966,12 +992,25 @@ int lf_sniff(bool realtime, bool verbose, uint64_t samples) {
             sample_bytes = WaitForRawDataTimeout(realtimeBuf, sample_bytes, 1000, true, false);
         }
         samples = sample_bytes * 8 / bits_per_sample;
-        PrintAndLogEx(INFO, "Done: %" PRIu64 " samples (%zu bytes)", samples, sample_bytes);
+        // the inline "Received x / y bytes" counter already says the transfer is
+        // done, so only repeat it in samples when asked
+        if (verbose) {
+            PrintAndLogEx(INFO, "Done: %" PRIu64 " samples (%zu bytes)", samples, sample_bytes);
+        }
         if (samples != 0) {
             getSamplesFromBufEx(realtimeBuf, samples, bits_per_sample, verbose);
         }
 
         free(realtimeBuf);
+
+        if (sample_bytes < expected_bytes) {
+            // keep what did arrive, but don't let it look like a complete read
+            PrintAndLogEx(WARNING, "transfer stopped early, got " _YELLOW_("%zu") " of " _YELLOW_("%zu") " bytes"
+                          , sample_bytes
+                          , expected_bytes
+                         );
+            return PM3_ETIMEOUT;
+        }
     } else {
         SendCommandNG(CMD_LF_SNIFF_RAW_ADC, (uint8_t *)&payload, sizeof(payload));
         PacketResponseNG resp;
@@ -1018,6 +1057,13 @@ int CmdLFSniff(const char *Cmd) {
     bool verbose = arg_get_lit(ctx, 2);
     bool cm = arg_get_lit(ctx, 3);
     CLIParserFree(ctx);
+
+    // anything past the graph buffer is streamed and then thrown away by
+    // getSamplesFromBufEx(), so don't spend the transfer time on it
+    if (samples > MAX_GRAPH_TRACE_LEN) {
+        PrintAndLogEx(INFO, "Capping to " _YELLOW_("%d") " samples, the graph buffer size", MAX_GRAPH_TRACE_LEN);
+        samples = MAX_GRAPH_TRACE_LEN;
+    }
 
     // it should be the result of BigBuf_max_traceLen(),
     // but IDK how to get it.
@@ -1609,8 +1655,7 @@ static bool check_chiptype(bool getDeviceData) {
     }
 
     //Save the state of the Graph and Demod Buffers
-    buffer_savestate_t saveState_gb = save_bufferS32(g_GraphBuffer, g_GraphTraceLen);
-    saveState_gb.offset = g_GridOffset;
+    buffer_savestate_t saveState_gb = save_graphbuffer();
     buffer_savestate_t saveState_db = save_buffer8(g_DemodBuffer, g_DemodBufferLen);
     saveState_db.clock = g_DemodClock;
     saveState_db.offset = g_DemodStartIdx;
@@ -1683,13 +1728,15 @@ static bool check_chiptype(bool getDeviceData) {
 
     PrintAndLogEx(INFO, "Couldn't identify a chipset");
 out:
-    restore_buffer8(saveState_db, g_DemodBuffer);
+    // the detections above demodulate, so the length comes back with the contents
+    g_DemodBufferLen = restore_buffer8(saveState_db, g_DemodBuffer);
     g_DemodClock = saveState_db.clock;
     g_DemodStartIdx = saveState_db.offset;
 
-    restore_bufferS32(saveState_gb, g_GraphBuffer);
-    g_GridOffset = saveState_gb.offset;
+    restore_graphbuffer(saveState_gb);
 
+    free_buffer_savestate(saveState_db);
+    free_buffer_savestate(saveState_gb);
     return retval;
 }
 
@@ -1890,7 +1937,7 @@ int CmdLFRelay(const char *Cmd) {
 
     if (is_rdr && (iplen == 0)) {
         PrintAndLogEx(ERR, "IP address is empty");
-        PrintAndLogEx(HINT, "try `" _YELLOW_("lf relay --rdr --ip <ip>") "`");
+        PrintAndLogEx(HINT, "Hint: try `" _YELLOW_("lf relay --rdr --ip <ip>") "`");
         return PM3_EINVARG;
     }
 
@@ -2176,6 +2223,22 @@ int CmdLFfind(const char *Cmd) {
             goto out;
         }
     }
+    if (demodWatchnet(true) == PM3_SUCCESS) {
+        PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("WatchNET ID") " found!");
+        if (search_cont) {
+            found++;
+        } else {
+            goto out;
+        }
+    }
+    if (demodLFICT(true) == PM3_SUCCESS) {
+        PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("ICT ID") " found!");
+        if (search_cont) {
+            found++;
+        } else {
+            goto out;
+        }
+    }
 
     // psk
     if (demodIdteck(NULL, true) == PM3_SUCCESS) {
@@ -2380,6 +2443,7 @@ static command_t CommandTable[] = {
     {"gproxii",     CmdLFGuard,         AlwaysAvailable, "{ Guardall Prox II RFIDs...  }"},
     {"hid",         CmdLFHID,           AlwaysAvailable, "{ HID Prox RFIDs...          }"},
     {"hitag",       CmdLFHitag,         AlwaysAvailable, "{ Hitag CHIPs...             }"},
+    {"ict",         CmdLFICT,           AlwaysAvailable, "{ ICT RFIDs...               }"},
     {"idteck",      CmdLFIdteck,        AlwaysAvailable, "{ Idteck RFIDs...            }"},
     {"indala",      CmdLFINDALA,        AlwaysAvailable, "{ Indala RFIDs...            }"},
     {"io",          CmdLFIO,            AlwaysAvailable, "{ ioProx RFIDs...            }"},
@@ -2400,6 +2464,7 @@ static command_t CommandTable[] = {
     {"trovan",      CmdLFTrovan,        AlwaysAvailable, "{ Trovan animal IDs...       }"},
     {"viking",      CmdLFViking,        AlwaysAvailable, "{ Viking RFIDs...            }"},
     {"visa2000",    CmdLFVisa2k,        AlwaysAvailable, "{ Visa2000 RFIDs...          }"},
+    {"watchnet",    CmdLFWatchnet,      AlwaysAvailable, "{ WatchNET RFIDs...          }"},
 //    {"zx",          CmdLFZx8211,        AlwaysAvailable, "{ ZX8211 RFIDs...            }"},
     {"-----------", CmdHelp,            AlwaysAvailable, "--------------------- " _CYAN_("General") " ---------------------"},
     {"config",      CmdLFConfig,        IfPm3Lf,         "Get/Set config for LF sampling, bit/sample, decimation, frequency"},

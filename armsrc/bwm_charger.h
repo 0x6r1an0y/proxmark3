@@ -28,12 +28,13 @@
 #define __BWM_CHARGER_H
 
 #include "common.h"
+#include "pm3_cmd.h"   // bwm_battery_info_t
 
 // Reference design capacity for the fitted cell (VXE 502540, 500 mAh / 3.7 V).
 // Used as the default target for `hw bwm setcap` and as the fall-back divisor for
 // the battery-health estimate.
 #define BWM_DEFAULT_DESIGN_CAP_MAH   500
-#define BWM_DEFAULT_VCHG_MV          4100   // default charge-voltage target (mV); snaps to 4095 (15mV step)
+#define BWM_DEFAULT_VCHG_MV          4200   // default charge-voltage target (mV), full charge of the 4.2 V cell
 
 #ifdef WITH_BWM_CHARGERKICK
 // Emergency charge-path enable. Clears the AW32001 shipping/FET-disabled state so
@@ -50,6 +51,13 @@ void bwm_detect_and_init(void);
 // Print the "Battery / BWM" section for `hw status`. Silent if no BWM was
 // detected by bwm_detect_and_init().
 void bwm_print_battery_status(void);
+
+// Fills in bwm_battery_info_t (pm3_cmd.h) for CMD_PM5_BWM_GET_BATTERY - same
+// underlying reads as bwm_print_battery_status(), so the two can't drift on
+// the numbers they share. Returns false (all fields zeroed) if no BWM was
+// detected. A false gauge_ok with bwm_present true means the charger ACKed
+// but the fuel gauge didn't.
+bool bwm_read_battery_info(bwm_battery_info_t *out);
 
 // One-time BQ27427 Design Capacity provisioning (CMD_PM5_BWM_SET_CAP /
 // `hw bwm setcap`). Idempotent - returns true without a CFGUPDATE cycle if the

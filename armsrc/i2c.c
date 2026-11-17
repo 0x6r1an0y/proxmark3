@@ -1175,7 +1175,7 @@ void sc_request_sam_t1_profile(void) {
 #endif
 }
 
-void sc_pps_remember(const uint8_t *atr, uint8_t atr_len, uint8_t proto, uint8_t ta1) {
+static void sc_pps_remember(const uint8_t *atr, uint8_t atr_len, uint8_t proto, uint8_t ta1) {
     if ((atr_len == 0) || (atr_len > sizeof(s_pps.atr))) {
         return;
     }
@@ -1185,7 +1185,7 @@ void sc_pps_remember(const uint8_t *atr, uint8_t atr_len, uint8_t proto, uint8_t
     s_pps.proto = proto;
 }
 
-void sc_pps_forget(void) {
+static void sc_pps_forget(void) {
     s_pps.atr_len = 0;
     s_pps.ta1 = 0;
     s_pps.tried = false;
@@ -1384,6 +1384,25 @@ void SmartCardRaw(const smart_card_raw_t *p) {
             if (gotATR == false) {
                 reply_ng(CMD_SMART_RAW, PM3_ESOFT, NULL, 0);
                 goto OUT;
+            }
+        }
+    }
+
+    // A card runs the protocol its TD1 names until a PPS changes it, so an APDU
+    // framed as T=1 against a card that came up in T=0 gets no answer at all.
+    // Do the switch here rather than making every caller run `smart pps --t1`
+    // first. PPS is only legal straight after an ATR, so take one; the exchange
+    // could not have worked without the switch anyway, so nothing is lost.
+    if (((flags & SC_RAW_T1) == SC_RAW_T1) && (s_pps_proto_cmd != I2C_DEVICE_CMD_SEND_T1)) {
+
+        smart_card_atr_t card;
+        s_pps.reapply = false;              // this is the negotiation
+        bool got_atr = GetATR(&card, false);
+        s_pps.reapply = true;
+
+        if (got_atr && ((s_card_protocols & SC_PROTO_T1) == SC_PROTO_T1)) {
+            if ((sc_pps(1, 0x11) == false) && (g_dbglevel >= DBG_ERROR)) {
+                DbpString("SC: " _YELLOW_("PPS to T=1 refused") ", sending it anyway");
             }
         }
     }

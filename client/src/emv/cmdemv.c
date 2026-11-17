@@ -16,6 +16,9 @@
 // EMV commands
 //-----------------------------------------------------------------------------
 
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200112L
+#endif
 #include "cmdemv.h"
 #include <string.h>
 #include "comms.h"          // DropField
@@ -292,7 +295,8 @@ static int emv_parse_track1(const uint8_t *d, size_t n, bool verbose) {
     char *tmp = str_ndup((const char *)d, n);
     uint8_t i = 0;
     const char delim[2] = "^";
-    char *token = strtok(tmp, delim);
+    char *saveptr = NULL;
+    char *token = strtok_r(tmp, delim, &saveptr);
     while (token != NULL) {
 
         switch (i) {
@@ -340,7 +344,7 @@ static int emv_parse_track1(const uint8_t *d, size_t n, bool verbose) {
             default:
                 break;
         }
-        token = strtok(0, delim);
+        token = strtok_r(NULL, delim, &saveptr);
         i++;
     }
     free(tmp);
@@ -653,9 +657,9 @@ static int CmdEMVSelect(const char *Cmd) {
             PrintAndLogEx(FAILED, "No answer from card ( %d )", res);
             if (channel == CC_CONTACT) {
                 if (GetSmartcardProtocolT1()) {
-                    PrintAndLogEx(HINT, "Hint: card was driven as T=1, drop `" _YELLOW_("--t1") "` to use T=0");
+                    PrintAndLogEx(HINT, "Hint: Card was driven as T=1. Drop `" _YELLOW_("--t1") "` to use T=0");
                 } else {
-                    PrintAndLogEx(HINT, "Hint: is the card T=1? try `" _YELLOW_("--t1") "`");
+                    PrintAndLogEx(HINT, "Hint: Is the card T=1? Try `" _YELLOW_("--t1") "`");
                 }
             }
         }
@@ -806,7 +810,7 @@ static int CmdEMVSearch(const char *Cmd) {
         // which protocols the card offers and cannot redirect a T=0 request to
         // a T=1 only card. That used to end here without a word.
         if ((channel == CC_CONTACT) && (activateField == false)) {
-            PrintAndLogEx(HINT, "Hint: the card is activated by `" _YELLOW_("-s") "`, try `" _YELLOW_("emv search -w -s") "`");
+            PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("emv search -w -s") "`");
         }
 
         tlvdb_free(t);
@@ -2979,7 +2983,7 @@ static int CmdEMVReader(const char *Cmd) {
                 if (channel == CC_CONTACT) {
                     smart_card_atr_t atr;
                     if (smart_select(false, &atr) == false) {
-                        PrintAndLogEx(HINT, "Hint: no answer at all - is a card in the slot? try `" _YELLOW_("smart info") "`");
+                        PrintAndLogEx(HINT, "Hint: Is a card in the slot? Try `" _YELLOW_("smart info") "`");
                     }
                 }
                 tlvdb_free(tlvSelect);
@@ -3171,4 +3175,3 @@ int CmdEMV(const char *Cmd) {
     clearCommandBuffer();
     return CmdsParse(CommandTable, Cmd);
 }
-

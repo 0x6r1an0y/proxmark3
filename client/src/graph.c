@@ -568,11 +568,11 @@ buffer_savestate_t save_buffer8(uint8_t *src, size_t length) {
     // 1/4 of the size needed
     size_t buffSize = (length / 4);
 
-    PrintAndLogEx(DEBUG, "(save_buffer8) buffSize = %llu, length = %llu", buffSize, length);
+    PrintAndLogEx(DEBUG, "(save_buffer8) buffSize = %zu, length = %zu", buffSize, length);
 
     if (length % 4) {
         buffSize++;
-        PrintAndLogEx(DEBUG, "(save_buffer8) new buffSize = %llu", buffSize);
+        PrintAndLogEx(DEBUG, "(save_buffer8) new buffSize = %zu", buffSize);
     }
 
     // calloc the memory needed
@@ -582,12 +582,9 @@ buffer_savestate_t save_buffer8(uint8_t *src, size_t length) {
         buffer_savestate_t bst = {0};
         return bst;
     }
-    size_t index = 0;
-
-    // Pack the source array into the backing array
-    for (size_t i = 0; i < length; i += 4) {
-        savedBuffer[index] = MemLeToUint4byte(src + i);
-        index++;
+    // Pack the source array into the backing array, little endian, last word zero padded
+    for (size_t i = 0; i < length; i++) {
+        savedBuffer[i / 4] |= (uint32_t)src[i] << ((i % 4) * 8);
     }
 
     buffer_savestate_t bst = {
@@ -647,4 +644,27 @@ size_t restore_buffer8(buffer_savestate_t saveState, uint8_t *dest) {
     }
 
     return index;
+}
+
+// Save/restore the graph buffer as a unit: contents, length and grid offset.
+// A caller that drops restore_bufferS32()'s return leaves g_GraphTraceLen short.
+buffer_savestate_t save_graphbuffer(void) {
+    buffer_savestate_t saveState = save_bufferS32(g_GraphBuffer, g_GraphTraceLen);
+    saveState.offset = g_GridOffset;
+    return saveState;
+}
+
+void restore_graphbuffer(buffer_savestate_t saveState) {
+    size_t len = restore_bufferS32(saveState, g_GraphBuffer);
+    if (len == 0) {
+        // nothing was restored, so leave the buffer and its length alone
+        return;
+    }
+    g_GraphTraceLen = len;
+    g_GridOffset = saveState.offset;
+}
+
+// restore_*() copy out of the save state, the owner frees it after its last restore
+void free_buffer_savestate(buffer_savestate_t saveState) {
+    free((void *)saveState.buffer);
 }

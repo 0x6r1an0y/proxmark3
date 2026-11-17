@@ -102,8 +102,9 @@ static int CmdConfigFpga(const char *Cmd) {
         }
         offset += chunk_size;
         // Print progress
-        PrintAndLogEx(INFO, "Sent "_YELLOW_("%zu")" bytes, progress: "_YELLOW_("%.2f%%"), chunk_size, (offset / (float)datalen) * 100);
+        PrintAndLogEx(INPLACE, "Sent "_YELLOW_("%zu")" bytes, progress: "_YELLOW_("%.2f%%"), chunk_size, (offset / (float)datalen) * 100);
     }
+    PrintAndLogEx(NORMAL, "");
 
     PrintAndLogEx(SUCCESS, "FPGA configuration transfer complete!");
 
@@ -138,8 +139,8 @@ static int CmdFpgaSetPowerPWM(const char *Cmd) {
         arg_param_begin,
         arg_lit0("l", "lf", "Set the driver voltage for LF. When not specified as LF, default setting for HF."),
         arg_int0("c", "count", "<int>", "PWM output low level counting used to control the voltage of the driver. "
-        "The larger the value, the higher the voltage; "
-        "the smaller the value, the lower the voltage."),
+                 "The larger the value, the higher the voltage; "
+                 "the smaller the value, the lower the voltage."),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);

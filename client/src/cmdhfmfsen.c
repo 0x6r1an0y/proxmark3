@@ -774,6 +774,8 @@ static int fm11_collect_nonces_from_default_key_fallback(const fm11_keylist_t *d
     }
 
     int retval = PM3_ESOFT;
+    // a key that authenticated reports its own failed nonce collection
+    bool key_found = false;
     uint32_t total = defaults->count * (FM11RF08S_SECTORS * 2);
     uint32_t done = 0;
 
@@ -808,6 +810,7 @@ static int fm11_collect_nonces_from_default_key_fallback(const fm11_keylist_t *d
                     if (e_sector[sec].foundKey[kt] == false) {
                         continue;
                     }
+                    key_found = true;
                     fm11_initial_key_t initial = {
                         .key = e_sector[sec].Key[kt] & 0xFFFFFFFFFFFFULL,
                         .block_no = mfFirstBlockOfSector(sec),
@@ -843,6 +846,7 @@ static int fm11_collect_nonces_from_default_key_fallback(const fm11_keylist_t *d
             int res = mf_check_keys(mfFirstBlockOfSector(real_sec32), kt, false, chunk, key_block, &out_key);
             done += chunk;
             if (res == PM3_SUCCESS) {
+                key_found = true;
                 fm11_initial_key_t initial = {
                     .key = out_key & 0xFFFFFFFFFFFFULL,
                     .block_no = mfFirstBlockOfSector(real_sec32),
@@ -862,7 +866,7 @@ static int fm11_collect_nonces_from_default_key_fallback(const fm11_keylist_t *d
                 }
                 PrintAndLogEx(WARNING, "Initial key did not collect nonce evidence, continuing dictionary search");
             }
-            if (res == PM3_ETIMEOUT || res == PM3_EOPABORTED) {
+            if (res == PM3_ETIMEOUT || res == PM3_EOPABORTED || res == PM3_ECARDEXCHANGE) {
                 retval = res;
                 break;
             }
@@ -871,7 +875,7 @@ static int fm11_collect_nonces_from_default_key_fallback(const fm11_keylist_t *d
     }
 
     fm11_sen_clear_inplace();
-    if (retval == PM3_ESOFT) {
+    if (retval == PM3_ESOFT && key_found == false) {
         PrintAndLogEx(WARNING, "Default-key dictionary did not authenticate to any FM11RF08S sector");
     }
     free(e_sector);
@@ -1569,8 +1573,40 @@ static int fm11_prioritize_defaults(fm11_keylist_t *list, const fm11_keylist_t *
     if (defaults == NULL || defaults->count == 0) {
         return PM3_SUCCESS;
     }
+    // index the candidates, else every one of the ~85k dictionary keys scans the whole list
+    uint32_t cap = 1;
+    while (cap < list->count * 2) {
+        cap <<= 1;
+    }
+    uint64_t *seen = calloc(cap, sizeof(uint64_t));     // key + 1, 0 is empty
+    if (seen != NULL) {
+        for (uint32_t i = 0; i < list->count; i++) {
+            uint64_t k = list->data[i].key & 0xFFFFFFFFFFFFULL;
+            uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 45) & (cap - 1);
+            while (seen[h] != 0 && seen[h] != k + 1) {
+                h = (h + 1) & (cap - 1);
+            }
+            seen[h] = k + 1;
+        }
+    }
+
     uint32_t dst = 0;
     for (uint32_t d = 0; d < defaults->count; d++) {
+        if (seen != NULL) {
+            uint64_t k = defaults->data[d].key & 0xFFFFFFFFFFFFULL;
+            uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 45) & (cap - 1);
+            bool present = false;
+            while (seen[h] != 0) {
+                if (seen[h] == k + 1) {
+                    present = true;
+                    break;
+                }
+                h = (h + 1) & (cap - 1);
+            }
+            if (present == false) {
+                continue;
+            }
+        }
         for (uint32_t i = dst; i < list->count; i++) {
             if (list->data[i].key == defaults->data[d].key) {
                 fm11_candidate_t tmp = list->data[dst];
@@ -1580,6 +1616,7 @@ static int fm11_prioritize_defaults(fm11_keylist_t *list, const fm11_keylist_t *
             }
         }
     }
+    free(seen);
     return PM3_SUCCESS;
 }
 
@@ -2175,7 +2212,7 @@ static void fm11_print_key_hit_row(uint32_t nonce_count, uint8_t sec, uint8_t kt
                   " Key sec " _YELLOW_("%03u") " key " _YELLOW_("%c") " = " _GREEN_("%012" PRIX64) "                        |"
                   " " _YELLOW_("%25s") " | %13s ",
                   (float)elapsed_key / 1000.0, nonce_count,
-                  fm11_real_sector(sec), kt ? 'B' : 'A', key & 0xFFFFFFFFFFFFULL,
+                  fm11_real_sector(sec), kt ? 'B' : 'A', (uint64_t)(key & 0xFFFFFFFFFFFFULL),
                   kcount, "");
 }
 
@@ -2193,16 +2230,20 @@ static bool fm11_key_matches_nonce(uint32_t uid,
                          ((((par_err >> 1) & 1) ^ oddparity8((nt_enc >>  8) & 0xFF)) << 1) |
                          ((((par_err >> 0) & 1) ^ oddparity8((nt_enc >>  0) & 0xFF)) << 0);
 
-    struct Crypto1State *s = crypto1_create(key & 0xFFFFFFFFFFFFULL);
-    if (s == NULL) {
-        return false;
+    // on the stack and a byte at a time: nearly every dictionary key dies on the first byte
+    struct Crypto1State s;
+    crypto1_init(&s, key & 0xFFFFFFFFFFFFULL);
+
+    uint32_t in = nt ^ uid;
+    for (int8_t byte_i = 3; byte_i >= 0; byte_i--) {
+        uint8_t shift = byte_i * 8;
+        uint8_t ks = crypto1_byte(&s, (in >> shift) & 0xFF, 0);
+        if ((uint8_t)(((nt >> shift) & 0xFF) ^ ks) != ((nt_enc >> shift) & 0xFF)) {
+            return false;
+        }
     }
-    uint32_t ks1 = crypto1_word(s, nt ^ uid, 0);
-    uint32_t ks2 = crypto1_word(s, 0, 0);
-    if ((nt ^ ks1) != nt_enc) {
-        crypto1_destroy(s);
-        return false;
-    }
+
+    uint32_t ks2 = crypto1_word(&s, 0, 0);
 
     for (uint8_t byte_i = 0; byte_i < 4; byte_i++) {
         if (parity_mask & (1U << byte_i)) {
@@ -2210,13 +2251,11 @@ static bool fm11_key_matches_nonce(uint32_t uid,
             uint8_t observed_dec = ((nt_par_enc >> byte_i) & 1) ^ ks_par;
             uint8_t nt_byte = (nt >> (byte_i * 8)) & 0xFF;
             if (observed_dec != oddparity8(nt_byte)) {
-                crypto1_destroy(s);
                 return false;
             }
         }
     }
 
-    crypto1_destroy(s);
     return true;
 }
 
@@ -2384,7 +2423,7 @@ normal_out:
                 fm11_print_key_hit_row(nonce_count, sec32, kt, keys_found[sec32][kt], found_key);
                 break;
             }
-            if (res == PM3_ETIMEOUT || res == PM3_EOPABORTED) {
+            if (res == PM3_ETIMEOUT || res == PM3_EOPABORTED || res == PM3_ECARDEXCHANGE) {
                 retval = res;
                 break;
             }
@@ -2663,7 +2702,7 @@ static int fm11_verify_candidates(uint8_t real_sec, uint8_t key_type, const fm11
                           real_sec, key_type ? 'B' : 'A');
             return PM3_ESOFT;
         }
-        if (res == PM3_EOPABORTED) {
+        if (res == PM3_EOPABORTED || res == PM3_ECARDEXCHANGE) {
             fm11_sen_clear_inplace();
             return res;
         }
@@ -2729,12 +2768,29 @@ static void fm11_print_key_table(const uint64_t keys_found[FM11RF08S_SECTORS][2]
     PrintAndLogEx(NORMAL, "");
 }
 
+// `hf-mf-<uid>-<base>[-<suffix>]`, matching the template `hf mf autopwn` uses
+static void fm11_build_filename(char *dst, size_t dst_len, const iso14a_card_select_t *card,  const char *base, const char *suffix) {
+
+    snprintf(dst, dst_len, "hf-mf-%s-%s%s%s"
+             , sprint_hex_inrow(card->uid, card->uidlen)
+             , base
+             , (suffix != NULL && suffix[0] != '\0') ? "-" : ""
+             , (suffix != NULL) ? suffix : ""
+            );
+}
+
 static int fm11_save_recovery_outputs(const iso14a_card_select_t *card, const iso14a_fm11rf08s_nonces_with_data_t *nonces,
                                       const uint64_t keys_found[FM11RF08S_SECTORS][2],
                                       const bool found_key[FM11RF08S_SECTORS][2],
-                                      bool no_oob, bool has_data) {
+                                      bool no_oob, bool has_data, const char *suffix, bool no_save) {
+
+    if (no_save) {
+        PrintAndLogEx(INFO, "Called with no save option");
+        return PM3_SUCCESS;
+    }
+
     char fn[FILE_PATH_SIZE] = {0};
-    snprintf(fn, sizeof(fn), "hf-mf-%s-key", sprint_hex_inrow(card->uid, card->uidlen));
+    fm11_build_filename(fn, sizeof(fn), card, "key", suffix);
     const uint64_t unknown_key = bytes_to_num(g_mifare_default_key, MIFARE_KEY_SIZE);
 
     uint8_t sector_count = FM11RF08S_NORMAL_SECTORS + (no_oob ? 0 : 1);
@@ -2771,15 +2827,15 @@ static int fm11_save_recovery_outputs(const iso14a_card_select_t *card, const is
         num_to_bytes(ka, MIFARE_KEY_SIZE, dump + trailer * MFBLOCK_SIZE);
         num_to_bytes(kb, MIFARE_KEY_SIZE, dump + trailer * MFBLOCK_SIZE + 10);
     }
-    snprintf(fn, sizeof(fn), "hf-mf-%s-dump", sprint_hex_inrow(card->uid, card->uidlen));
-    return saveFileEx(fn, ".bin", dump, sizeof(dump), spDump);
+    fm11_build_filename(fn, sizeof(fn), card, "dump", suffix);
+    return pm3_save_mf_dump(fn, dump, sizeof(dump), jsfCardMemory);
 }
 
 static int fm11_select_mifare_classic(iso14a_card_select_t *card_out) {
     uint64_t tagT = GetHF14AMfU_Type();
     if (tagT != MFU_TT_UL_ERROR) {
         PrintAndLogEx(ERR, "Detected a MIFARE Ultralight/C/NTAG Compatible card.");
-        PrintAndLogEx(ERR, "This command targets " _YELLOW_("MIFARE Classic"));
+        PrintAndLogEx(HINT, "This command targets " _YELLOW_("MIFARE Classic"));
         return PM3_ESOFT;
     }
 
@@ -2796,7 +2852,7 @@ static int fm11_select_mifare_classic(iso14a_card_select_t *card_out) {
     uint64_t select_status = sel_2763;
     if (select_status == 0) {
         PrintAndLogEx(FAILED, "No tag detected or other tag communication error");
-        PrintAndLogEx(HINT, "Hint: Try some distance or position of the card");
+        PrintAndLogEx(HINT, "Hint: Reposition tag and try again");
         return PM3_ECARDEXCHANGE;
     }
 
@@ -2869,7 +2925,10 @@ static int fm11_select_mifare_classic(iso14a_card_select_t *card_out) {
     return PM3_SUCCESS;
 }
 
-int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline_only, int max_online_candidates, uint8_t parity_mask, bool skip_default_key_check, const sector_t *known_sectors, size_t known_sector_count) {
+int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline_only,
+                   int max_online_candidates, uint8_t parity_mask, bool skip_default_key_check,
+                   const sector_t *known_sectors, size_t known_sector_count, const char *suffix,
+                   bool no_save) {
 
     iso14a_card_select_t card = {0};
     iso14a_fm11rf08s_nonces_with_data_t nonces = {0};
@@ -2914,7 +2973,7 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
         if (retval != PM3_SUCCESS) {
             DropField();
             PrintAndLogEx(WARNING, "Unable to collect FM11RF08S nonce evidence with the default-key dictionary");
-            PrintAndLogEx(HINT, "Hint: provide nonce evidence with `hf mf isen --collect_fm11rf08s_without_backdoor` and a known key");
+            PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mf isen --collect_fm11rf08s_without_backdoor") "` and a known key");
             fm11_keylist_free(&default_keys);
             return retval;
         }
@@ -2930,17 +2989,24 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
     }
 
     uint32_t nonce_count = FM11RF08S_SECTORS * 2;
-    char activity[80];
-    snprintf(activity, sizeof(activity), "Loaded card UID %08X using %s key %s", uid,
-             collected_with_backdoor ? "backdoor" : "dictionary",
-             sprint_hex_inrow(active_key, MIFARE_KEY_SIZE));
+    char activity[80] = {0};
+    snprintf(activity, sizeof(activity), "Loaded card UID %08X using %s key %s"
+             , uid
+             , collected_with_backdoor ? "backdoor" : "dictionary"
+             , sprint_hex_inrow(active_key, MIFARE_KEY_SIZE)
+            );
+
     fm11_sen_progress(nonce_count, activity, 0, 0);
+
+    // a nonce file not saved
+    int keep_res = PM3_SUCCESS;
     if (keep_nonces) {
         char nonce_fn[FILE_PATH_SIZE] = {0};
-        snprintf(nonce_fn, sizeof(nonce_fn), "hf-mf-%s-nonces%s", sprint_hex_inrow(card.uid, card.uidlen),
-                 collected_with_data ? "_with_data" : "");
-        pm3_save_fm11rf08s_nonces(nonce_fn, &nonces, collected_with_data);
-        fm11_sen_progress(nonce_count, "Saved nonce/data evidence JSON", 0, 0);
+        fm11_build_filename(nonce_fn, sizeof(nonce_fn), &card, collected_with_data ? "nonces_with_data" : "nonces", suffix);
+        keep_res = pm3_save_fm11rf08s_nonces(nonce_fn, &nonces, collected_with_data);
+        if (keep_res == PM3_SUCCESS) {
+            fm11_sen_progress(nonce_count, "Saved nonce/data evidence JSON", 0, 0);
+        }
     }
 
     uint64_t keys_found[FM11RF08S_SECTORS][2] = {{0}};
@@ -2967,6 +3033,7 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
             (void)fm11_keylist_add_unique(&confirmed_reuse_keys, known_key);
         }
     }
+
     if (seeded_known > 0) {
         fm11_sen_progress(nonce_count, "Seed known keys from earlier autopwn stages", seeded_known, 0);
     }
@@ -2989,24 +3056,30 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
     if (skip_default_key_check) {
         fm11_sen_progress(nonce_count, "Skip default-key dictionary check already done by autopwn", seeded_known, 0);
     } else {
+
         fm11_sen_progress(nonce_count, "Check default-key dictionary against nonce evidence", default_keys.count, 0);
+
         retval = fm11_check_default_keys(uid, nonce_count, &nonces, &default_keys, parity_mask, keys_found, found_key);
         if (retval != PM3_SUCCESS) {
             goto out;
         }
+
         for (uint8_t sec = 0; sec < FM11RF08S_SECTORS; sec++) {
             for (uint8_t kt = 0; kt < 2; kt++) {
                 if (found_key[sec][kt] == false) {
                     continue;
                 }
+
                 uint64_t key = keys_found[sec][kt] & 0xFFFFFFFFFFFFULL;
                 if (fm11_keylist_has_key(&confirmed_reuse_keys, key)) {
                     continue;
                 }
+
                 retval = fm11_keylist_add_unique(&confirmed_reuse_keys, key);
                 if (retval != PM3_SUCCESS) {
                     goto out;
                 }
+
                 uint32_t reuse_found = fm11_propagate_key_reuse_online(nonce_count, key, keys_found, found_key);
                 if (reuse_found > 0) {
                     snprintf(activity, sizeof(activity), "Key re-use propagation confirmed %u additional key slots", reuse_found);
@@ -3022,12 +3095,16 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
     }
 
     fm11_sen_progress(nonce_count, "Generate first-pass candidates from nT/{nT}/parity", 0, 0);
+
     for (uint8_t sec = 0; sec < FM11RF08S_SECTORS; sec++) {
+
         uint8_t real_sec = fm11_real_sector(sec);
         for (uint8_t kt = 0; kt < 2; kt++) {
+
             if (found_key[sec][kt]) {
                 continue;
             }
+
             uint32_t nt = fm11_bytes_to_u32(nonces.nt[sec][kt]);
             uint32_t nt_enc = fm11_bytes_to_u32(nonces.nt_enc[sec][kt]);
             int res = fm11_generate_1nt_candidates(uid, nt, nt_enc, nonces.par_err[sec][kt], parity_mask, &candidates[sec][kt]);
@@ -3037,19 +3114,23 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
             }
             fm11_prioritize_defaults(&candidates[sec][kt], &default_keys);
         }
+
         uint32_t nt_a = fm11_bytes_to_u32(nonces.nt[sec][0]);
         uint32_t nt_b = fm11_bytes_to_u32(nonces.nt[sec][1]);
+
         if (nt_a != nt_b && found_key[sec][0] == false && found_key[sec][1] == false) {
             int res = fm11_intersect_pair(nt_a, &candidates[sec][0], nt_b, &candidates[sec][1]);
             if (res != PM3_SUCCESS) {
                 retval = res;
                 goto out;
             }
+
             res = fm11_prioritize_by_paired_seed(&candidates[sec][0], &candidates[sec][1]);
             if (res != PM3_SUCCESS) {
                 retval = res;
                 goto out;
             }
+
             res = fm11_prioritize_by_paired_seed(&candidates[sec][1], &candidates[sec][0]);
             if (res != PM3_SUCCESS) {
                 retval = res;
@@ -3057,27 +3138,37 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
             }
             fm11_sort_candidates_by_seed_bucket(&candidates[sec][0], &candidates[sec][1]);
         }
+
         fm11_prioritize_defaults(&candidates[sec][0], &default_keys);
         fm11_prioritize_defaults(&candidates[sec][1], &default_keys);
+
         if (real_sec == 32) {
             fm11_prioritize_0000_prefix(&candidates[sec][1]);
         }
-        snprintf(activity, sizeof(activity), "Prepared sec %03u candidates (A %u / B %u)",
-                 real_sec, candidates[sec][0].count, candidates[sec][1].count);
+        snprintf(activity, sizeof(activity), "Prepared sec %03u candidates (A %u / B %u)"
+                 , real_sec
+                 , candidates[sec][0].count
+                 , candidates[sec][1].count
+                );
         fm11_sen_progress(nonce_count, activity, candidates[sec][0].count + candidates[sec][1].count, 0);
     }
 
     if (reader_mode) {
+
         uint32_t accepted = fm11_apply_reader_material(&nonces, candidates, keys_found, found_key, reader_keys, reader_found);
         if (accepted > 0) {
+
             snprintf(activity, sizeof(activity), "Applied %u reader-recovered key%s", accepted, (accepted == 1) ? "" : "s");
             fm11_sen_progress(nonce_count, activity, accepted, 0);
+
             uint32_t reduced = 0;
             uint32_t derived = fm11_offline_fixpoint(&nonces, candidates, keys_found, found_key, &reduced, offline_only);
+
             if (reduced > 0) {
                 snprintf(activity, sizeof(activity), "Reduced paired candidate sets by %u keys", reduced);
                 fm11_sen_progress(nonce_count, activity, reduced, 0);
             }
+
             if (derived > 0) {
                 snprintf(activity, sizeof(activity), "Derived %u paired keys from reader material", derived);
                 fm11_sen_progress(nonce_count, activity, derived, 0);
@@ -3090,12 +3181,14 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
         total_candidates += candidates[sec][0].count;
         total_candidates += candidates[sec][1].count;
     }
+
     uint32_t duplicate_candidates = 0;
     uint32_t duplicate_prefix[FM11RF08S_SECTORS][2] = {{0}};
     retval = fm11_prioritize_duplicates(candidates, duplicate_prefix, &duplicate_candidates);
     if (retval != PM3_SUCCESS) {
         goto out;
     }
+
     uint32_t verify_eta = (total_candidates / 2 / FM11RF08S_FCHK_KEYS_PER_SECOND) + 5;
     snprintf(activity, sizeof(activity), "Prioritized candidates (%u duplicate-priority)", duplicate_candidates);
     fm11_sen_progress(nonce_count, activity, total_candidates, verify_eta);
@@ -3104,6 +3197,7 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
     if (retval != PM3_SUCCESS) {
         goto out;
     }
+
     snprintf(activity, sizeof(activity), "Indexed %u candidate refs for key-reuse cascades", reuse_index.ref_count);
     fm11_sen_progress(nonce_count, activity, reuse_index.ref_count, 0);
 
@@ -3114,22 +3208,29 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
         fm11_keylist_free(&priority);
         goto out;
     }
+
     uint32_t found_before = fm11_count_found_keys(found_key);
     uint32_t priority_count = priority.count;
+
     if (priority_count > 0) {
-        snprintf(activity, sizeof(activity), "Batch-check top %u/%u cross-sector reuse keys with fchk",
-                 priority_count, reuse_eligible);
+
+        snprintf(activity, sizeof(activity), "Batch-check top %u/%u cross-sector reuse keys with fchk", priority_count, reuse_eligible);
+
         fm11_sen_progress(nonce_count, activity, priority_count, (priority_count / FM11RF08S_FCHK_KEYS_PER_SECOND) + 2);
+
         retval = fm11_verify_global_priority_keys(&priority, keys_found, found_key);
         fm11_keylist_free(&priority);
+
         if (retval != PM3_SUCCESS) {
             goto out;
         }
+
         uint32_t found_after = fm11_count_found_keys(found_key);
         if (found_after > found_before) {
             snprintf(activity, sizeof(activity), "Reuse-priority fchk recovered %u normal-sector keys", found_after - found_before);
             fm11_sen_progress(nonce_count, activity, found_after - found_before, 0);
         }
+
     } else {
         fm11_keylist_free(&priority);
     }
@@ -3140,21 +3241,29 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
         fm11_keylist_free(&priority);
         goto out;
     }
+
     found_before = fm11_count_found_keys(found_key);
     priority_count = priority.count;
+
     if (priority_count > 0 && priority_count <= FM11RF08S_MAX_GLOBAL_PRIORITY_KEYS) {
+
         snprintf(activity, sizeof(activity), "Batch-check %u duplicate-priority keys with fchk", priority_count);
         fm11_sen_progress(nonce_count, activity, priority_count, (priority_count / FM11RF08S_FCHK_KEYS_PER_SECOND) + 2);
+
         retval = fm11_verify_global_priority_keys(&priority, keys_found, found_key);
+
         fm11_keylist_free(&priority);
+
         if (retval != PM3_SUCCESS) {
             goto out;
         }
+
         uint32_t found_after = fm11_count_found_keys(found_key);
         if (found_after > found_before) {
             snprintf(activity, sizeof(activity), "Batch fchk recovered %u normal-sector keys", found_after - found_before);
             fm11_sen_progress(nonce_count, activity, found_after - found_before, 0);
         }
+
     } else {
         fm11_keylist_free(&priority);
         if (priority_count > FM11RF08S_MAX_GLOBAL_PRIORITY_KEYS) {
@@ -3162,6 +3271,7 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
             fm11_sen_progress(nonce_count, activity, priority_count, 0);
         }
     }
+
     uint32_t propagated = fm11_propagate_found_keys(&nonces, candidates, keys_found, found_key);
     if (propagated > 0) {
         snprintf(activity, sizeof(activity), "Propagated %u reused candidate key matches", propagated);
@@ -3174,6 +3284,7 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
         snprintf(activity, sizeof(activity), "Reduced paired candidate sets by %u keys", reduced);
         fm11_sen_progress(nonce_count, activity, reduced, 0);
     }
+
     if (derived > 0) {
         snprintf(activity, sizeof(activity), "Derived %u paired keys from matching FM11RF08S seeds", derived);
         fm11_sen_progress(nonce_count, activity, derived, 0);
@@ -3183,22 +3294,25 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
     if (retval != PM3_SUCCESS) {
         goto out;
     }
+
     snprintf(activity, sizeof(activity), "Refreshed %u candidate refs for key-reuse cascades", reuse_index.ref_count);
     fm11_sen_progress(nonce_count, activity, reuse_index.ref_count, 0);
 
     total_candidates = fm11_count_unfound_candidates(candidates, found_key);
-    if (max_online_candidates > 0 && (int)total_candidates > max_online_candidates) {
-        PrintAndLogEx(WARNING, "Total unfound candidates (%u) exceeds --max-online-candidates limit (%d), stopping",
-                      total_candidates, max_online_candidates);
-        goto out;
+    // over the limit the online phase is skipped,  the keys found so far are kept
+    bool over_limit = (max_online_candidates > 0 && (int)total_candidates > max_online_candidates);
+    if (over_limit) {
+        PrintAndLogEx(WARNING, "Total unfound candidates (%u) exceeds --max-online-candidates limit (%d), stopping", total_candidates, max_online_candidates);
     }
-    if (offline_only) {
+
+    if (offline_only || over_limit) {
         fm11_sen_progress_footer();
         fm11_print_key_table(keys_found, found_key);
-        retval = fm11_save_recovery_outputs(&card, &nonces, keys_found, found_key, no_oob, collected_with_data);
+        retval = fm11_save_recovery_outputs(&card, &nonces, keys_found, found_key, no_oob, collected_with_data, suffix, no_save);
         PrintAndLogEx(SUCCESS, "time in sen " _YELLOW_("%.0f") " seconds", (float)(msclock() - t1) / 1000.0);
         goto out;
     }
+
     verify_eta = (total_candidates / 2 / FM11RF08S_FCHK_KEYS_PER_SECOND) + 5;
     fm11_sen_progress(nonce_count, "Measurement: score unresolved candidate paths", total_candidates, 0);
     fm11_measure_candidate_paths(&nonces, candidates, keys_found, found_key, nonce_count);
@@ -3210,20 +3324,25 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
      */
     bool exhausted[FM11RF08S_SECTORS][2] = {{false}};
     uint32_t probe_pos = 0;
+
     while (true) {
+
         if (kbd_enter_pressed()) {
             retval = PM3_EOPABORTED;
             goto out;
         }
-        /* find the cheapest unfound, non-exhausted (sec, kt) pair */
+
+        // find the cheapest unfound, non-exhausted (sec, kt) pair
         uint8_t best_sec = 0xFF, best_kt = 0;
         uint32_t best_cost = UINT32_MAX;
         uint32_t best_count = UINT32_MAX;
+
         for (uint8_t sec = 0; sec < FM11RF08S_SECTORS; sec++) {
             for (uint8_t kt = 0; kt < 2; kt++) {
                 if (found_key[sec][kt] || exhausted[sec][kt]) {
                     continue;
                 }
+
                 uint32_t cnt = candidates[sec][kt].count;
                 uint32_t cost = fm11_estimate_candidate_path_cost(&nonces, candidates, keys_found, found_key, sec, kt);
                 if (sec == FM11RF08S_SECTORS - 1 && kt == 1 && cnt > 0) {
@@ -3232,6 +3351,7 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
                         cost = best_cost > 0 ? best_cost - 1 : 0;
                     }
                 }
+
                 if (cost < best_cost || (cost == best_cost && cnt < best_count)) {
                     best_cost = cost;
                     best_count = cnt;
@@ -3240,87 +3360,120 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
                 }
             }
         }
+
+        // all sectors/keys found or exhausted
         if (best_sec == 0xFF) {
-            break;  /* all sectors/keys found or exhausted */
+            break;
         }
+
         uint8_t sec = best_sec;
         uint8_t kt  = best_kt;
         uint8_t real_sec = fm11_real_sector(sec);
+
         if (found_key[sec][kt ^ 1]) {
+
             uint32_t nt_target = fm11_bytes_to_u32(nonces.nt[sec][kt]);
             uint32_t nt_known = fm11_bytes_to_u32(nonces.nt[sec][kt ^ 1]);
+
             if (nt_target != nt_known) {
+
                 uint16_t seed = fm11_compute_seednt16_nt32(nt_known, keys_found[sec][kt ^ 1]);
                 uint32_t old_count = 0;
                 uint32_t new_count = 0;
+
                 int filter_res = fm11_filter_candidates_by_seed(&candidates[sec][kt], nt_target, seed, &old_count, &new_count);
                 if (filter_res != PM3_SUCCESS) {
                     retval = filter_res;
                     goto out;
                 }
+
                 if (old_count > new_count) {
                     snprintf(activity, sizeof(activity), "Reduced paired candidate set by %u keys", old_count - new_count);
                     fm11_sen_progress(nonce_count, activity, old_count - new_count, 0);
                 }
+
             } else {
                 fm11_keylist_promote_existing(&candidates[sec][kt], keys_found[sec][kt ^ 1]);
             }
         }
-        snprintf(activity, sizeof(activity), "sec %03u key %c - checking %u candidates", real_sec, kt ? 'B' : 'A', candidates[sec][kt].count);
 
-        fm11_sen_progress(nonce_count, activity, candidates[sec][kt].count,
-                          (candidates[sec][kt].count / 2 / FM11RF08S_FCHK_KEYS_PER_SECOND) + 1);
+        snprintf(activity, sizeof(activity), "sec %03u key %c - checking %u candidates", real_sec, kt ? 'B' : 'A', candidates[sec][kt].count);
+        fm11_sen_progress(nonce_count, activity, candidates[sec][kt].count, (candidates[sec][kt].count / 2 / FM11RF08S_FCHK_KEYS_PER_SECOND) + 1);
+
         uint64_t key = 0;
         int res = fm11_verify_candidates(real_sec, kt, &candidates[sec][kt], &key);
         if (res == PM3_SUCCESS) {
+
             propagated = fm11_accept_found_key_global(&nonces, candidates, keys_found, found_key, &reuse_index, sec, kt, key, &probe_queue);
             fm11_print_key_hit_row(nonce_count, sec, kt, key, found_key);
+
             uint32_t reuse_found = 0;
             if (fm11_keylist_has_key(&confirmed_reuse_keys, key) == false) {
                 (void)fm11_keylist_add_unique(&confirmed_reuse_keys, key);
                 reuse_found = fm11_propagate_key_reuse_online(nonce_count, key, keys_found, found_key);
             }
+
             if (reuse_found > 0) {
                 snprintf(activity, sizeof(activity), "Key re-use propagation confirmed %u additional key slots", reuse_found);
                 fm11_sen_progress(nonce_count, activity, reuse_found, 0);
                 propagated += fm11_accept_found_key_global(&nonces, candidates, keys_found, found_key, &reuse_index, sec, kt, key, &probe_queue);
             }
+
             if (propagated > 1) {
                 snprintf(activity, sizeof(activity), "Propagated %u reused candidate key matches", propagated - 1);
                 fm11_sen_progress(nonce_count, activity, propagated - 1, 0);
             }
+
             reduced = 0;
             derived = fm11_offline_fixpoint(&nonces, candidates, keys_found, found_key, &reduced, false);
             if (reduced > 0) {
                 snprintf(activity, sizeof(activity), "Reduced paired candidate sets by %u keys", reduced);
                 fm11_sen_progress(nonce_count, activity, reduced, 0);
             }
+
             if (derived > 0) {
                 snprintf(activity, sizeof(activity), "Derived %u additional paired keys", derived);
                 fm11_sen_progress(nonce_count, activity, derived, 0);
             }
+
             while (probe_pos < probe_queue.count) {
                 uint8_t ps = probe_queue.entries[probe_pos].sec;
                 uint8_t pk = probe_queue.entries[probe_pos].key_type;
                 uint64_t pkey = probe_queue.entries[probe_pos].key;
+
                 probe_pos++;
                 if (found_key[ps][pk]) {
                     continue;
                 }
+
                 fm11_keylist_t single = {0};
+
                 if (fm11_keylist_push(&single, pkey, 0) == PM3_SUCCESS) {
+
                     uint8_t real_ps = fm11_real_sector(ps);
                     uint64_t out_key = 0;
-                    if (fm11_verify_candidates(real_ps, pk, &single, &out_key) == PM3_SUCCESS) {
+
+                    // aborted, no answer or card gone
+                    int probe_res = fm11_verify_candidates(real_ps, pk, &single, &out_key);
+                    if (probe_res == PM3_ETIMEOUT || probe_res == PM3_EOPABORTED || probe_res == PM3_ECARDEXCHANGE) {
+                        fm11_keylist_free(&single);
+                        retval = probe_res;
+                        goto out;
+                    }
+
+                    if (probe_res == PM3_SUCCESS) {
+
                         uint32_t prop = fm11_accept_found_key_global(&nonces, candidates, keys_found, found_key, &reuse_index, ps, pk, out_key, &probe_queue);
                         if (prop > 0) {
                             fm11_print_key_hit_row(nonce_count, ps, pk, out_key, found_key);
                         }
+
                         uint32_t reuse_extra = 0;
                         if (fm11_keylist_has_key(&confirmed_reuse_keys, out_key) == false) {
                             (void)fm11_keylist_add_unique(&confirmed_reuse_keys, out_key);
                             reuse_extra = fm11_propagate_key_reuse_online(nonce_count, out_key, keys_found, found_key);
                         }
+
                         if (reuse_extra > 0) {
                             snprintf(activity, sizeof(activity), "Key re-use propagation confirmed %u additional key slots", reuse_extra);
                             fm11_sen_progress(nonce_count, activity, reuse_extra, 0);
@@ -3330,37 +3483,54 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
                 }
             }
             total_candidates = fm11_count_unfound_candidates(candidates, found_key);
-        } else if (res == PM3_ETIMEOUT || res == PM3_EOPABORTED) {
+
+        } else if (res == PM3_ETIMEOUT || res == PM3_EOPABORTED || res == PM3_ECARDEXCHANGE) {
             retval = res;
             goto out;
         } else {
-            /* candidate set exhausted without finding a key */
+            // candidate set exhausted without finding a key
             exhausted[sec][kt] = true;
         }
     }
 
-    /* drain probe queue: verify single-key probes scheduled by fm11_accept_found_key_global */
+    // drain probe queue: verify single-key probes scheduled by fm11_accept_found_key_global
     for (uint32_t pi = probe_pos; pi < probe_queue.count; pi++) {
+
         uint8_t ps = probe_queue.entries[pi].sec;
         uint8_t pk = probe_queue.entries[pi].key_type;
         uint64_t pkey = probe_queue.entries[pi].key;
+
         if (found_key[ps][pk]) {
             continue;
         }
+
         fm11_keylist_t single = {0};
         if (fm11_keylist_push(&single, pkey, 0) == PM3_SUCCESS) {
+
             uint8_t real_ps = fm11_real_sector(ps);
             uint64_t out_key = 0;
-            if (fm11_verify_candidates(real_ps, pk, &single, &out_key) == PM3_SUCCESS) {
+
+            // aborted, no answer or card gone
+            int probe_res = fm11_verify_candidates(real_ps, pk, &single, &out_key);
+            if (probe_res == PM3_ETIMEOUT || probe_res == PM3_EOPABORTED || probe_res == PM3_ECARDEXCHANGE) {
+                fm11_keylist_free(&single);
+                retval = probe_res;
+                goto out;
+            }
+
+            if (probe_res == PM3_SUCCESS) {
+
                 uint32_t prop = fm11_accept_found_key_global(&nonces, candidates, keys_found, found_key, &reuse_index, ps, pk, out_key, &probe_queue);
                 if (prop > 0) {
                     fm11_print_key_hit_row(nonce_count, ps, pk, out_key, found_key);
                 }
+
                 uint32_t reuse_extra = 0;
                 if (fm11_keylist_has_key(&confirmed_reuse_keys, out_key) == false) {
                     (void)fm11_keylist_add_unique(&confirmed_reuse_keys, out_key);
                     reuse_extra = fm11_propagate_key_reuse_online(nonce_count, out_key, keys_found, found_key);
                 }
+
                 if (reuse_extra > 0) {
                     snprintf(activity, sizeof(activity), "Key re-use propagation confirmed %u additional key slots", reuse_extra);
                     fm11_sen_progress(nonce_count, activity, reuse_extra, 0);
@@ -3372,10 +3542,22 @@ int HFMFSENRecover(bool keep_nonces, bool no_oob, bool reader_mode, bool offline
 
     fm11_sen_progress_footer();
     fm11_print_key_table(keys_found, found_key);
-    retval = fm11_save_recovery_outputs(&card, &nonces, keys_found, found_key, no_oob, collected_with_data);
+    retval = fm11_save_recovery_outputs(&card, &nonces, keys_found, found_key, no_oob, collected_with_data, suffix, no_save);
     PrintAndLogEx(SUCCESS, "time in sen " _YELLOW_("%.0f") " seconds", (float)(msclock() - t1) / 1000.0);
 
 out:
+    // stopped by Enter, a timeout or the card,  close the progress table
+    if (retval == PM3_EOPABORTED || retval == PM3_ETIMEOUT || retval == PM3_ECARDEXCHANGE) {
+        fm11_sen_finish_inplace();
+        fm11_sen_progress_footer();
+        if (retval == PM3_EOPABORTED) {
+            PrintAndLogEx(WARNING, "\naborted via keyboard!");
+        }
+    }
+    // a check stopped between or inside its chunks leaves the field on
+    if (retval != PM3_SUCCESS) {
+        DropField();
+    }
     fm11_reuse_index_free(&reuse_index);
     fm11_keylist_free(&confirmed_reuse_keys);
     fm11_keylist_free(&default_keys);
@@ -3383,7 +3565,7 @@ out:
         fm11_keylist_free(&candidates[sec][0]);
         fm11_keylist_free(&candidates[sec][1]);
     }
-    return retval;
+    return (retval != PM3_SUCCESS) ? retval : keep_res;
 }
 
 int CmdHF14AMfSEN(const char *Cmd) {
@@ -3393,7 +3575,9 @@ int CmdHF14AMfSEN(const char *Cmd) {
                   "hf mf sen\n"
                   "hf mf sen --keep-nonces\n"
                   "hf mf sen --no-oob\n"
-                  "hf mf sen --reader\n");
+                  "hf mf sen --reader\n"
+                  "hf mf sen --suffix mycard\n"
+                  "hf mf sen --ns\n");
     void *argtable[] = {
         arg_param_begin,
         arg_lit0(NULL, "keep-nonces", "save collected nonce/data JSON evidence"),
@@ -3403,6 +3587,8 @@ int CmdHF14AMfSEN(const char *Cmd) {
         arg_lit0(NULL, "online-confirm", "only do online confirmation (skip generation if nonces loaded)"),
         arg_int0(NULL, "max-online-candidates", "<n>", "abort online phase if total candidates exceed this limit"),
         arg_str0(NULL, "parity-mask", "<hex>", "parity filter mask 1..F (default 1 = vetted staticnested_1nt behavior)"),
+        arg_str0(NULL, "suffix", "<txt>", "Add this suffix to generated files"),
+        arg_lit0(NULL, "ns", "no save to file (--keep-nonces still writes its evidence file)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -3412,24 +3598,35 @@ int CmdHF14AMfSEN(const char *Cmd) {
     bool offline_only = arg_get_lit(ctx, 4);
     bool online_confirm = arg_get_lit(ctx, 5);
     int max_online_candidates = arg_get_int_def(ctx, 6, 0);
+
     /* Only bit 0 (byte 0 parity) carries reliable data leakage from FM11RF08S.
      * Bits 1-3 are not valid keystream leakage for this card variant - using
      * them filters out correct keys.  Override via --parity-mask if needed for
-     * any weird chinese clones, normally you should never use this parameter. */
+     * any weird chinese clones, normally you should never use this parameter.
+     */
     uint8_t parity_mask = 0x1;
     {
-        int pm_len = 0;
         char pm_str[8] = {0};
+        int pm_len = sizeof(pm_str) - 1; // CLIGetStrWithReturn does not guarantee string to be null-terminated
         if (arg_get_str_len(ctx, 7) > 0) {
             CLIGetStrWithReturn(ctx, 7, (uint8_t *)pm_str, &pm_len);
-            unsigned long pm_val = strtoul(pm_str, NULL, 16);
-            if (pm_val >= 1 && pm_val <= 0xF) {
-                parity_mask = (uint8_t)(pm_val & 0x0F);
+            char *pm_end = NULL;
+            unsigned long pm_val = strtoul(pm_str, &pm_end, 16);
+            if (pm_end == pm_str || *pm_end != '\0' || pm_val < 1 || pm_val > 0xF) {
+                PrintAndLogEx(ERR, "Invalid parity mask (must be 1..F)");
+                CLIParserFree(ctx);
+                return PM3_EINVARG;
             }
+            parity_mask = (uint8_t)(pm_val & 0x0F);
         }
     }
     (void)online_confirm;
+
+    int sfxlen = 0;
+    char suffix[FILE_PATH_SIZE] = {0};
+    CLIParamStrToBuf(arg_get_str(ctx, 8), (uint8_t *)suffix, FILE_PATH_SIZE, &sfxlen);
+    bool no_save = arg_get_lit(ctx, 9);
     CLIParserFree(ctx);
 
-    return HFMFSENRecover(keep_nonces, no_oob, reader_mode, offline_only, max_online_candidates, parity_mask, false, NULL, 0);
+    return HFMFSENRecover(keep_nonces, no_oob, reader_mode, offline_only, max_online_candidates, parity_mask, false, NULL, 0, suffix, no_save);
 }
